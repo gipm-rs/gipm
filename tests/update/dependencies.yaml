@@ -1,0 +1,18 @@
+dependencies:
+  - version: "~3"
+    url: https://gitlab.com/libeigen/eigen.git
+  - version: "^7.88"
+    url: https://github.com/curl/curl.git
+    prefix: curl-
+    replacement:
+      - ["_", "."]
+  - version: 1.2.13
+    url: https://github.com/madler/zlib.git
+  - version: ~3.4
+    url: https://github.com/openssl/openssl.git
+    prefix: openssl-
+  - version: "~0.4"
+    url: https://github.com/slowmman/test-repo-1.git
+
+config:
+  url."https://github".insteadOf: git://github

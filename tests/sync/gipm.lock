@@ -1,0 +1,37 @@
+version = "1"
+
+[packages.curl]
+version = "7.88.1"
+source = "https://github.com/curl/curl.git"
+commit = "046209e561b7e9b5aab1aef7daebf29ee6e6e8c7"
+
+[packages.eigen]
+version = "3.3.8"
+source = "https://gitlab.com/libeigen/eigen.git"
+commit = "dc252fbf00079ccab57948a164b1421703fe4361"
+
+[packages.openssl]
+version = "3.5.0-beta1"
+source = "https://github.com/openssl/openssl.git"
+commit = "0c6656a7a31492ddd61e3d0d8b0e66645f4b2d6f"
+
+[packages.test-repo-1]
+version = "0.4.0"
+source = "https://github.com/slowmman/test-repo-1.git"
+commit = "a4b8466e32968999a84a22456bc30431321cf2ea"
+
+[packages.test-repo-1.dependencies]
+"github.com/slowmman/test-repo-1" = "^2.0"
+
+[packages.test-repo-2]
+version = "2.0.0"
+source = "https://github.com/slowmman/test-repo-2.git"
+commit = "576b3bdd7284fe2b3c85ca1e8f83f1b31dd4208e"
+
+[packages.test-repo-2.dependencies]
+"github.com/slowmman/test-repo-2" = "=3.3.8"
+
+[packages.zlib]
+version = "1.3.1"
+source = "https://github.com/madler/zlib.git"
+commit = "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"

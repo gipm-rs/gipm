@@ -1,0 +1,54 @@
+[package]
+name = "gipm"
+version = "0.1.0"
+edition = "2024"
+description = "Gipm is a git package manager"
+license = "MIT"
+homepage = "https://github.com/gipm-rs/gipm"
+repository = "https://github.com/gipm-rs/gipm"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# for semver_pubgrub
+serde = []
+
+[dependencies]
+gix = { version = "^0.73.0", features = ["blocking-http-transport-reqwest"]}
+gitoxide = { version = "^0.45.0", default-features = false, features = ["max-pure"]}
+anyhow = "^1.0"
+tokio = { version = "^1.0", features = ["full"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_yaml = "^0.9"
+semver = { version = "^1.0", features = ["serde"] }
+regex = "^1.10"
+pubgrub = "^0.3"
+url = "^2.5"
+rayon = "^1"
+once_cell = "^1.21"
+chrono = { version = "^0.4", features = ["serde"] }
+toml = "^0.9"
+clap = { version = "^4.0", features = ["derive"] }
+
+# For semver_pubgrub
+zerocopy = { version = "0.8.14", features = ["derive"] }
+
+[dev-dependencies]
+gipm = { path = "." }
+
+[[test]]
+name = "test_lockfile"
+path = "tests/test_lockfile.rs"
+
+[[test]]
+name = "test_update"
+path = "tests/update/test_update.rs"
+
+[[test]]
+name = "test_sync"
+path = "tests/sync/test_sync.rs"
+
+[[test]]
+name = "test_clean"
+path = "tests/clean/test_clean.rs"
