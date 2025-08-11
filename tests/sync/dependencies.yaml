@@ -11,8 +11,8 @@ dependencies:
   - version: ~3.4
     url: https://github.com/openssl/openssl.git
     prefix: openssl-
-  - version: "~0.4"
-    url: https://github.com/slowmman/test-repo-1.git
+  - version: "~0.5"
+    url: https://github.com/gipm-rs/test-repo-1.git
 
 config:
   url."https://github".insteadOf: git://github

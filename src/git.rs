@@ -118,7 +118,7 @@ impl GitPackage {
 
         // Peel the tag to get the commit
         let target = tag_ref.peel_to_id_in_place()?;
-        let commit = db_repo.find_object(target)?.into_commit();
+        let commit = db_repo.find_object(target)?.peel_to_commit()?;
 
         // Get the tree from the commit
         let tree = commit.tree()?;
@@ -155,12 +155,11 @@ impl GitPackage {
                 "Version {version} not found in all_versions"
             ))?
         );
-        let tag_ref = db_repo
+        let mut tag_ref = db_repo
             .find_reference(&tag_ref_name)
             .expect("Should have found a matching version");
-        println!("Tag ref: {:?}", tag_ref);
-        let target = tag_ref.id();
-        Ok(target.to_string())
+        let target = tag_ref.peel_to_commit()?;
+        Ok(target.id.to_string())
     }
 
     pub fn does_id_exist_in_db(&self, object: impl Into<ObjectId>) -> anyhow::Result<bool> {
@@ -795,12 +794,12 @@ impl GitPackage {
         let checkout_repo = gix::open(self.get_checkout_path()?)?;
         let object = object.into();
         let commit = match checkout_repo.find_object(object) {
-            Ok(object) => object.into_commit(),
+            Ok(object) => object.peel_to_commit()?,
             Err(e) => match e {
                 gix::object::find::existing::Error::NotFound { oid: _ } => {
                     // Fetch the object first
                     self.fetch_ref_from_db(object, sub_progress)?;
-                    checkout_repo.find_object(object)?.into_commit()
+                    checkout_repo.find_object(object)?.peel_to_commit()?
                 }
                 _ => {
                     anyhow::bail!(
@@ -1160,7 +1159,7 @@ impl GitPackage {
                         .context(format!("Could not find tag ref {tag_ref_name}"))?;
 
                     // 2. Peel the tag to the target object (usually a commit)
-                    let target = tag_ref.peel_to_id_in_place()?;
+                    let target = tag_ref.peel_to_commit()?.id;
 
                     match self
                         .checkout_object_from_database(target, &mut sub_progress_checkout_overall)
@@ -1173,9 +1172,7 @@ impl GitPackage {
                             let update = gix::refs::transaction::Change::Update {
                                 log: Default::default(),
                                 expected: gix::refs::transaction::PreviousValue::Any,
-                                new: gix::refs::Target::Symbolic(
-                                    format!("refs/tags/{tag_name}").try_into().expect("valid"),
-                                ),
+                                new: gix::refs::Target::Object(target),
                             };
 
                             checkout_repo.edit_reference(gix::refs::transaction::RefEdit {
