@@ -203,7 +203,8 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     let mut lockfile = LockFile::default();
     for (dep, version) in &resolved_dependencies {
         if dep.name() != root_dep.clone().name() {
-            let commit = dep.get_commit_hash_for_version(version)?;
+            let repo = gix::open(dep.get_checkout_path()?)?;
+            let commit = repo.head_commit().expect("HEAD should exist");
             let package_dependencies = dep.fetch_dependencies_yaml(version)?;
             let mut deps_map = BTreeMap::new();
             if let Some(deps) = package_dependencies {
@@ -225,7 +226,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
                 dep.name(),
                 version.clone(),
                 dep.url.clone(),
-                commit,
+                commit.id.to_string(),
                 dependencies_to_add,
             )?;
         }

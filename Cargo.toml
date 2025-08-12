@@ -1,6 +1,6 @@
 [package]
 name = "gipm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Gipm is a git package manager"
 license = "MIT"
@@ -11,8 +11,7 @@ repository = "https://github.com/gipm-rs/gipm"
 path = "src/lib.rs"
 
 [features]
-# for semver_pubgrub
-serde = []
+serde = ["pubgrub/serde", "semver/serde"]
 
 [dependencies]
 gix = { version = "^0.73.0", features = ["blocking-http-transport-reqwest"]}

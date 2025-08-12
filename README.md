@@ -4,8 +4,7 @@
 
 ## Installation
 
-- `cargo install --git <repo>`
-  - TODO: publish to crates.io
+- `cargo install gipm`
 
 ## Use
 
@@ -40,8 +39,8 @@ dependencies:
   - version: ~3.4
     url: https://github.com/openssl/openssl.git
     prefix: openssl-
-  - version: "~0.3"
-    url: git@github.com:slowmman/test-repo-1.git
+  - version: "~0.4"
+    url: https://github.com/slowmman/test-repo-1.git
 ```
 
 `gipm` will recursively solve the dependency problem by considering further `dependency.yaml` files at each of these repositories and versions. `gix` facilitates an efficient in-process extraction of the yaml file without any extra overhead of needing to to a tree checkout for this resolution process.

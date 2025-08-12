@@ -16,20 +16,20 @@ source = "https://github.com/openssl/openssl.git"
 commit = "0c6656a7a31492ddd61e3d0d8b0e66645f4b2d6f"
 
 [packages.test-repo-1]
-version = "0.4.0"
-source = "https://github.com/slowmman/test-repo-1.git"
-commit = "a4b8466e32968999a84a22456bc30431321cf2ea"
+version = "0.5.0"
+source = "https://github.com/gipm-rs/test-repo-1.git"
+commit = "b201728b680c661b2ef48bd82a9f86d64ac8ae44"
 
 [packages.test-repo-1.dependencies]
-"github.com/slowmman/test-repo-1" = "^2.0"
+"github.com/gipm-rs/test-repo-1" = "^2.0"
 
 [packages.test-repo-2]
 version = "2.0.0"
-source = "https://github.com/slowmman/test-repo-2.git"
+source = "https://github.com/gipm-rs/test-repo-2.git"
 commit = "576b3bdd7284fe2b3c85ca1e8f83f1b31dd4208e"
 
 [packages.test-repo-2.dependencies]
-"github.com/slowmman/test-repo-2" = "=3.3.8"
+"github.com/gipm-rs/test-repo-2" = "=3.3.8"
 
 [packages.zlib]
 version = "1.3.1"

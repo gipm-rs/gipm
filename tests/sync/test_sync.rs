@@ -23,7 +23,7 @@ fn test_sync() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         result.is_ok(),
-        "Failed to sync dependencies: {:?}",
+        "Failed to sync dependencieqs: {:?}",
         result.err()
     );
 

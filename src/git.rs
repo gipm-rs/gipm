@@ -118,7 +118,7 @@ impl GitPackage {
 
         // Peel the tag to get the commit
         let target = tag_ref.peel_to_id_in_place()?;
-        let commit = db_repo.find_object(target)?.into_commit();
+        let commit = db_repo.find_object(target)?.peel_to_commit()?;
 
         // Get the tree from the commit
         let tree = commit.tree()?;
@@ -155,12 +155,11 @@ impl GitPackage {
                 "Version {version} not found in all_versions"
             ))?
         );
-        let tag_ref = db_repo
+        let mut tag_ref = db_repo
             .find_reference(&tag_ref_name)
             .expect("Should have found a matching version");
-        println!("Tag ref: {:?}", tag_ref);
-        let target = tag_ref.id();
-        Ok(target.to_string())
+        let target = tag_ref.peel_to_commit()?;
+        Ok(target.id.to_string())
     }
 
     pub fn does_id_exist_in_db(&self, object: impl Into<ObjectId>) -> anyhow::Result<bool> {
@@ -795,12 +794,12 @@ impl GitPackage {
         let checkout_repo = gix::open(self.get_checkout_path()?)?;
         let object = object.into();
         let commit = match checkout_repo.find_object(object) {
-            Ok(object) => object.into_commit(),
+            Ok(object) => object.peel_to_commit()?,
             Err(e) => match e {
                 gix::object::find::existing::Error::NotFound { oid: _ } => {
                     // Fetch the object first
                     self.fetch_ref_from_db(object, sub_progress)?;
-                    checkout_repo.find_object(object)?.into_commit()
+                    checkout_repo.find_object(object)?.peel_to_commit()?
                 }
                 _ => {
                     anyhow::bail!(
@@ -1065,7 +1064,7 @@ impl GitPackage {
         let update = gix::refs::transaction::Change::Update {
             log: Default::default(),
             expected: gix::refs::transaction::PreviousValue::Any,
-            new: object.into(),
+            new: commit.id.into(),
         };
 
         checkout_repo.edit_reference(gix::refs::transaction::RefEdit {
@@ -1160,10 +1159,13 @@ impl GitPackage {
                         .context(format!("Could not find tag ref {tag_ref_name}"))?;
 
                     // 2. Peel the tag to the target object (usually a commit)
-                    let target = tag_ref.peel_to_id_in_place()?;
+                    let target = tag_ref.peel_to_commit()?;
 
                     match self
-                        .checkout_object_from_database(target, &mut sub_progress_checkout_overall)
+                        .checkout_object_from_database(
+                            target.id,
+                            &mut sub_progress_checkout_overall,
+                        )
                         .context(format!(
                             "Failed to checkout tag {tag_name} for {}",
                             self.name()
@@ -1173,9 +1175,7 @@ impl GitPackage {
                             let update = gix::refs::transaction::Change::Update {
                                 log: Default::default(),
                                 expected: gix::refs::transaction::PreviousValue::Any,
-                                new: gix::refs::Target::Symbolic(
-                                    format!("refs/tags/{tag_name}").try_into().expect("valid"),
-                                ),
+                                new: target.id.into(),
                             };
 
                             checkout_repo.edit_reference(gix::refs::transaction::RefEdit {
@@ -1244,7 +1244,7 @@ impl GitPackage {
                 }
             });
 
-            sub_progress_checkout_overall.init(Some(2), gix::progress::count("actions"));
+            sub_progress_checkout_overall.init(Some(3), gix::progress::count("actions"));
 
             let mut sub_progress_fetch = sub_progress_checkout_overall.add_child(format!(
                 "Fetching {checkout_dir:?} ref {name_ref:?} (tag {tag_name})"
@@ -1262,7 +1262,7 @@ impl GitPackage {
             let mut sub_progress_checkout = sub_progress_checkout_overall
                 .add_child(format!("Checking out worktree for {checkout_dir:?}"));
 
-            prepare_checkout
+            let (repo, _outcome) = prepare_checkout
                 .main_worktree(&mut sub_progress_checkout, &gix::interrupt::IS_INTERRUPTED)
                 .context("Failed to checkout")?;
 
@@ -1270,13 +1270,61 @@ impl GitPackage {
 
             sub_progress_checkout_overall.inc();
 
-            let stop = Instant::now();
+            // We checked out a symbolic ref, which we MIGHT need to resolve from a grafted and/or tag ref to the proper commit.
+            // If we don't do this, the HEAD may mismatch the .lock file, leading to much confusion.
 
-            sub_progress_checkout_overall.done(format!(
-                "Completed in {:.02} seconds",
-                (stop - start_overall).as_secs_f32()
-            ));
+            // Furthermore, calling the chekout_object_from_database will handle submodule init.
+
+            // 2. Peel the tag to the target object (usually a commit)
+            let commit = repo
+                .head_commit()
+                .expect("Should have a HEAD, we just checked it out");
+
+            match self
+                .checkout_object_from_database(commit.id, &mut sub_progress_checkout_overall)
+                .context(format!(
+                    "Failed to checkout tag {tag_name} for {}",
+                    self.name()
+                )) {
+                Ok(_) => {
+                    // Update the HEAD reference to point to the correct tag ref
+                    let update = gix::refs::transaction::Change::Update {
+                        log: Default::default(),
+                        expected: gix::refs::transaction::PreviousValue::Any,
+                        new: commit.id.into(),
+                    };
+
+                    repo.edit_reference(gix::refs::transaction::RefEdit {
+                        change: update,
+                        name: "HEAD".try_into().expect("valid"),
+                        deref: false,
+                    })?;
+
+                    let stop_overall = Instant::now();
+
+                    sub_progress_checkout_overall.done(format!(
+                        "Checked out {version} in {:.02} seconds",
+                        (stop_overall - start_overall).as_secs_f32(),
+                    ));
+                }
+                Err(e) => {
+                    sub_progress_checkout_overall.fail(format!(
+                        "Failed to checkout tag {tag_name} for {}: {e}",
+                        self.name()
+                    ));
+                    anyhow::bail!("Failed to checkout tag {tag_name} for {}: {e}", self.name());
+                }
+            }
         }
+
+        sub_progress_checkout_overall.inc();
+
+        let stop = Instant::now();
+
+        sub_progress_checkout_overall.done(format!(
+            "Completed in {:.02} seconds",
+            (stop - start_overall).as_secs_f32()
+        ));
 
         drop(sub_progress_checkout_overall);
 
