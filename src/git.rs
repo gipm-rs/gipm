@@ -335,7 +335,17 @@ impl GitPackage {
         }
 
         // Try to parse as semver directly
-        Version::parse(&tag).ok()
+        match Version::parse(&tag) {
+            Ok(ver) => {
+                // Ignore versions with pre-release or build metadata (only accept stable versions)
+                if ver.pre.is_empty() && ver.build.is_empty() {
+                    Some(ver)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
     }
 
     /// Parse version requirement with prefix and replacement handling

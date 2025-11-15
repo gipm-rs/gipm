@@ -10,7 +10,7 @@
             "name": "Debug",
             "program": "${workspaceFolder}/target/debug/gipm",
             "args": "update",
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}/tests/update"
         }
     ]
 }
