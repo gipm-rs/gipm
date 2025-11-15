@@ -40,7 +40,7 @@ dependencies:
     url: https://github.com/openssl/openssl.git
     prefix: openssl-
   - version: "~0.4"
-    url: https://github.com/slowmman/test-repo-1.git
+    url: https://github.com/gipm-rs/test-repo-1.git
 ```
 
 `gipm` will recursively solve the dependency problem by considering further `dependency.yaml` files at each of these repositories and versions. `gix` facilitates an efficient in-process extraction of the yaml file without any extra overhead of needing to to a tree checkout for this resolution process.

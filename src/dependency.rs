@@ -1,4 +1,5 @@
 use crate::git::GitPackage;
+use crate::git::PackageUrl;
 use crate::third_party::semver_pubgrub::SemverPubgrub;
 use anyhow::{Context, Result};
 use pubgrub::Ranges;
@@ -54,7 +55,7 @@ impl DependencySpecification {
 
     pub fn to_package_and_version_range(&self) -> Result<(GitPackage, SemverPubgrub<Version>)> {
         let package = GitPackage::new(
-            self.url.clone(),
+            PackageUrl::GitUrl(self.url.clone()),
             self.prefix.clone(),
             self.replacement.clone(),
         );
