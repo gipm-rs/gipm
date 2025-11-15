@@ -1,5 +1,4 @@
 use crate::dependency::{DependencySpecification, parse_dependencies_yaml_content};
-use crate::git;
 use crate::{PROGRESS, VERBOSE};
 use anyhow::{Context, Result};
 use gix::ObjectId;
@@ -14,15 +13,47 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env::{current_dir, home_dir};
 use std::fmt;
+use std::fmt::Display;
 use std::fs::{create_dir_all, metadata, remove_dir_all, remove_file, set_permissions};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageUrl {
+    GitUrl(String),
+    Root,
+}
+
+impl Display for PackageUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackageUrl::GitUrl(url) => write!(f, "{}", url),
+            PackageUrl::Root => write!(f, "Root Package"),
+        }
+    }
+}
+
+impl PackageUrl {
+    pub fn as_str(&self) -> &str {
+        match self {
+            PackageUrl::GitUrl(url) => url.as_str(),
+            PackageUrl::Root => "Root Package",
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            PackageUrl::GitUrl(url) => url.as_bytes(),
+            PackageUrl::Root => b"Root Package",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq)]
 pub struct GitPackage {
-    pub url: String,
+    pub url: PackageUrl,
     pub prefix: Option<String>,
     pub replacements: Option<Vec<[String; 2]>>,
     db_up_to_date: bool,
@@ -44,7 +75,7 @@ impl PartialEq for GitPackage {
 
 impl GitPackage {
     pub fn new(
-        url: String,
+        url: PackageUrl,
         prefix: Option<String>,
         replacements: Option<Vec<[String; 2]>>,
     ) -> Self {
@@ -58,7 +89,16 @@ impl GitPackage {
     }
 
     pub fn get_database_path(&self) -> anyhow::Result<PathBuf> {
-        get_database_path(&self.url)
+        let normalized = normalize_url(&self.url);
+
+        // Hash the normalized url
+        let mut hasher = DefaultHasher::new();
+        normalized.hash(&mut hasher);
+        let hash = format!("{:x}", hasher.finish());
+
+        let home = home_dir().expect("Could not determine home directory");
+        let path: PathBuf = home.join(".gipm").join("db").join(hash);
+        Ok(path)
     }
 
     pub fn get_available_versions(&self) -> Option<&HashMap<Version, String>> {
@@ -92,7 +132,7 @@ impl GitPackage {
         &self,
         version: &Version,
     ) -> Result<Option<Vec<DependencySpecification>>> {
-        let db_path = git::get_database_path(&self.url)?;
+        let db_path = self.get_database_path()?;
 
         if !db_path.exists() {
             // If database doesn't exist, we can't check for transitive deps. A database should always exist.
@@ -117,7 +157,7 @@ impl GitPackage {
             .expect("Should have found a matching version");
 
         // Peel the tag to get the commit
-        let target = tag_ref.peel_to_id_in_place()?;
+        let target = tag_ref.peel_to_id()?;
         let commit = db_repo.find_object(target)?.peel_to_commit()?;
 
         // Get the tree from the commit
@@ -172,6 +212,7 @@ impl GitPackage {
 
         let object_str = match &object {
             ObjectId::Sha1(id) => std::str::from_utf8(id)?,
+            &_ => anyhow::bail!("Future - need to support for non-sha1 object ids"),
         };
 
         let db_repo = gix::open(&db_path)?;
@@ -204,20 +245,25 @@ impl GitPackage {
     }
 
     pub fn get_checkout_path(&self) -> anyhow::Result<PathBuf> {
-        // Extract the repository name from the end of the URL and create a PathBuf: cwd/.gitvenv/<repo>
+        match &self.url {
+            PackageUrl::GitUrl(s) => {
+                // Extract the repository name from the end of the URL and create a PathBuf: cwd/.gitvenv/<repo>
 
-        // Remove trailing '/' if present
-        let url = self.url.trim_end_matches('/');
-        // Get the last path segment after '/' or '\'
-        let repo_url = self.url.rsplit(&['/', '\\'][..]).next().unwrap_or(url);
-        // Remove .git suffix if present
-        let repo_name = repo_url
-            .strip_suffix(".git")
-            .unwrap_or(repo_url)
-            .to_string();
+                // Remove trailing '/' if present
+                let repo_url = s.trim_end_matches('/');
+                // Get the last path segment after '/' or '\'
+                let repo_url = repo_url.rsplit(&['/', '\\'][..]).next().unwrap_or(repo_url);
+                // Remove .git suffix if present
+                let repo_name = repo_url
+                    .strip_suffix(".git")
+                    .unwrap_or(repo_url)
+                    .to_string();
 
-        let cwd = current_dir()?;
-        Ok(cwd.join(".gitvenv").join(repo_name))
+                let cwd = current_dir()?;
+                Ok(cwd.join(".gitvenv").join(repo_name))
+            }
+            PackageUrl::Root => unreachable!("Root package does not have a checkout path"),
+        }
     }
 
     /// Get all available versions from a git package
@@ -1349,81 +1395,68 @@ impl fmt::Display for GitPackage {
     }
 }
 
-pub fn normalize_url(url: &str) -> String {
+pub fn normalize_url(url: &PackageUrl) -> String {
     // Try to parse as a URL to handle userinfo (username:token@)
     // If parsing fails, fallback to manual normalization
-    if let Ok(parsed) = url::Url::parse(url) {
-        // Remove username and password if present
-        let mut normalized = String::new();
-        // Scheme is ignored for hashing
-        if let Some(host) = parsed.host_str() {
-            normalized.push_str(host);
+    match &url {
+        PackageUrl::GitUrl(s) => {
+            if let Ok(parsed) = url::Url::parse(s) {
+                // Remove username and password if present
+                let mut normalized = String::new();
+                // Scheme is ignored for hashing
+                if let Some(host) = parsed.host_str() {
+                    normalized.push_str(host);
+                }
+                if let Some(port) = parsed.port() {
+                    normalized.push(':');
+                    normalized.push_str(&port.to_string());
+                }
+                // Add path, removing trailing .git and slashes
+                let mut path = parsed.path().trim_end_matches('/').to_string();
+                if let Some(stripped) = path.strip_suffix(".git") {
+                    path = stripped.to_string();
+                }
+                normalized.push_str(&path);
+                // Lowercase for case-insensitivity
+                return normalized.to_ascii_lowercase();
+            }
+
+            // Fallback: manual normalization for scp-like and other forms
+            let s = s
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_start_matches("ssh://")
+                .trim_start_matches("git://")
+                .trim_start_matches("git@");
+
+            // Remove userinfo if present (username:token@)
+            let s = if let Some(at_idx) = s.find('@') {
+                &s[at_idx + 1..]
+            } else {
+                s
+            };
+
+            // For git@github.com:user/repo.git, convert ':' to '/'
+            let s = if let Some(idx) = s.find(':') {
+                // Only replace the first ':' after the host
+                let (host, rest) = s.split_at(idx);
+                let rest = &rest[1..]; // skip the ':'
+                format!("{host}/{rest}")
+            } else {
+                s.to_string()
+            };
+
+            // Remove trailing .git if present
+            let s = s.strip_suffix(".git").unwrap_or(&s);
+
+            // Remove trailing slashes
+            let s = s.trim_end_matches('/');
+
+            // Lowercase for case-insensitivity
+            s.to_ascii_lowercase()
         }
-        if let Some(port) = parsed.port() {
-            normalized.push(':');
-            normalized.push_str(&port.to_string());
-        }
-        // Add path, removing trailing .git and slashes
-        let mut path = parsed.path().trim_end_matches('/').to_string();
-        if let Some(stripped) = path.strip_suffix(".git") {
-            path = stripped.to_string();
-        }
-        normalized.push_str(&path);
-        // Lowercase for case-insensitivity
-        return normalized.to_ascii_lowercase();
+        PackageUrl::Root => "ROOT".to_string(),
     }
-
-    // Fallback: manual normalization for scp-like and other forms
-    let url = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("ssh://")
-        .trim_start_matches("git://")
-        .trim_start_matches("git@");
-
-    // Remove userinfo if present (username:token@)
-    let url = if let Some(at_idx) = url.find('@') {
-        &url[at_idx + 1..]
-    } else {
-        url
-    };
-
-    // For git@github.com:user/repo.git, convert ':' to '/'
-    let url = if let Some(idx) = url.find(':') {
-        // Only replace the first ':' after the host
-        let (host, rest) = url.split_at(idx);
-        let rest = &rest[1..]; // skip the ':'
-        format!("{host}/{rest}")
-    } else {
-        url.to_string()
-    };
-
-    // Remove trailing .git if present
-    let url = url.strip_suffix(".git").unwrap_or(&url);
-
-    // Remove trailing slashes
-    let url = url.trim_end_matches('/');
-
-    // Lowercase for case-insensitivity
-    url.to_ascii_lowercase()
-}
-
-pub fn get_database_path(
-    // path should be a hashed version of the url
-    url: &str,
-) -> anyhow::Result<PathBuf> {
-    // Normalize the URL so that different schemes and forms hash the same way
-
-    let normalized = normalize_url(url);
-
-    // Hash the normalized url
-    let mut hasher = DefaultHasher::new();
-    normalized.hash(&mut hasher);
-    let hash = format!("{:x}", hasher.finish());
-
-    let home = home_dir().expect("Could not determine home directory");
-    let path: PathBuf = home.join(".gipm").join("db").join(hash);
-    Ok(path)
 }
 
 fn update_submodules(git_dir: &str, progress: Option<&mut Item>) -> anyhow::Result<()> {

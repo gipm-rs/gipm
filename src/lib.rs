@@ -5,6 +5,7 @@ pub mod git;
 pub mod lockfile;
 pub mod resolver;
 use crate::git::GitPackage;
+use crate::git::PackageUrl;
 use anyhow::Context;
 use gix::progress::tree::Root;
 use lockfile::LockFile;
@@ -48,7 +49,11 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
     let checkout_results: Vec<(&str, &str, anyhow::Result<()>)> = packages
         .par_iter()
         .map(|(name, package)| -> (&str, &str, anyhow::Result<()>) {
-            let mut dep = GitPackage::new(package.source.clone(), Some(name.clone()), None);
+            let mut dep = GitPackage::new(
+                PackageUrl::GitUrl(package.source.clone()),
+                Some(name.clone()),
+                None,
+            );
             let object = match package.commit.parse::<gix::ObjectId>() {
                 Ok(object) => object,
                 Err(e) => {
@@ -148,7 +153,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     let mut resolver = GitDependencyProvider::default();
 
     // Parse the entry dependencies with a dummy root node
-    let root_dep = GitPackage::new("GIPM_DUMMY_ROOT_URL".to_string(), None, None);
+    let root_dep = GitPackage::new(git::PackageUrl::Root, None, None);
     let dummy_root_version = Version::new(0, 0, 0);
 
     let dependency_specs = dependency::parse_dependencies_yaml_file("dependencies.yaml")?;
@@ -225,7 +230,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
             lockfile.add_package(
                 dep.name(),
                 version.clone(),
-                dep.url.clone(),
+                dep.url.as_str().to_string(),
                 commit.id.to_string(),
                 dependencies_to_add,
             )?;

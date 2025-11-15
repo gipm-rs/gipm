@@ -1,6 +1,6 @@
 [package]
 name = "gipm"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Gipm is a git package manager"
 license = "MIT"
@@ -14,8 +14,8 @@ path = "src/lib.rs"
 serde = ["pubgrub/serde", "semver/serde"]
 
 [dependencies]
-gix = { version = "^0.73.0", features = ["blocking-http-transport-reqwest"]}
-gitoxide = { version = "^0.45.0", default-features = false, features = ["max-pure"]}
+gix = { version = "^0.74.0", features = ["blocking-http-transport-reqwest"]}
+gitoxide = { version = "^0.46.0", default-features = false, features = ["max-pure"]}
 anyhow = "^1.0"
 tokio = { version = "^1.0", features = ["full"] }
 serde = { version = "^1.0", features = ["derive"] }
