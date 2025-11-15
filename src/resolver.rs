@@ -2,6 +2,7 @@ use crate::dependency::{
     dependency_spec_to_package_and_version_range, parse_dependencies_yaml_file,
 };
 use crate::git::GitPackage;
+use crate::git::PackageUrl;
 use anyhow::Result;
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, Map, PackageResolutionStatistics,
@@ -50,12 +51,12 @@ impl DependencyCache {
         package: &GitPackage,
         version: &Version,
     ) -> Result<Dependencies<GitPackage, VS, String>, Infallible> {
-        let dep_spec = match package.url.as_str() {
-            "GIPM_DUMMY_ROOT_URL" => Some(
+        let dep_spec = match &package.url {
+            PackageUrl::Root => Some(
                 parse_dependencies_yaml_file("dependencies.yaml")
                     .expect("Failed to parse dependencies"),
             ),
-            _ => match package.fetch_dependencies_yaml(version) {
+            PackageUrl::GitUrl(_) => match package.fetch_dependencies_yaml(version) {
                 Ok(p) => p,
                 Err(e) => {
                     println!(
