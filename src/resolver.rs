@@ -13,6 +13,7 @@ use semver::Version;
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 // Version set type
@@ -20,6 +21,7 @@ type VS = Ranges<Version>;
 
 struct DependencyCache {
     dependencies: Map<GitPackage, BTreeMap<Version, DependencyConstraints<GitPackage, VS>>>,
+    dbs_updated: HashMap<PackageUrl, bool>,
 }
 
 impl DependencyCache {
@@ -27,6 +29,7 @@ impl DependencyCache {
     pub fn new() -> Self {
         Self {
             dependencies: Map::default(),
+            dbs_updated: HashMap::default(),
         }
     }
 
@@ -71,18 +74,24 @@ impl DependencyCache {
         let mut constraints = DependencyConstraints::default();
         if let Some(dep_spec) = dep_spec {
             match dependency_spec_to_package_and_version_range(dep_spec) {
-                Ok(mut deps_vec) => {
-                    // If we already have a dependency of a package, make sure we re-use that value from the dependency cache rather than the newly created package
-                    // TODO - this can probably be improved by never making the extra Package to begin with, though that's likely not a significant optmization.
-                    for (dep, _) in deps_vec.iter_mut() {
-                        if let Some((k, _)) = self.dependencies.get_key_value(dep) {
-                            *dep = k.clone();
-                        }
-                    }
+                Ok(deps_vec) => {
+                    let mut deps_to_update = deps_vec
+                        .iter()
+                        .filter(|(dep, _)| {
+                            !self.dbs_updated.get(&dep.url).copied().unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
 
-                    deps_vec.par_iter_mut().for_each(|(dep, _)| {
+                    // Update databases in parallel
+                    deps_to_update.par_iter_mut().for_each(|(dep, _)| {
                         dep.update_db().expect("Failed to update db");
                     });
+
+                    // Update the map of updated dbs, so we avoid redundant updates
+                    for (dep, _) in &deps_to_update {
+                        self.dbs_updated.insert(dep.url.clone(), true);
+                    }
 
                     // Constraints are handled post update
                     for (dep, vers) in &deps_vec {

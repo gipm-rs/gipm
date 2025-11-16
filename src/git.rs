@@ -51,12 +51,17 @@ impl PackageUrl {
     }
 }
 
+impl Hash for PackageUrl {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        normalize_url(self).hash(state)
+    }
+}
+
 #[derive(Debug, Clone, Eq)]
 pub struct GitPackage {
     pub url: PackageUrl,
     pub prefix: Option<String>,
     pub replacements: Option<Vec<[String; 2]>>,
-    db_up_to_date: bool,
     // Map of versions to tag names
     all_versions: Option<HashMap<Version, String>>,
 }
@@ -79,13 +84,16 @@ impl GitPackage {
         prefix: Option<String>,
         replacements: Option<Vec<[String; 2]>>,
     ) -> Self {
-        GitPackage {
+        let mut p = GitPackage {
             url,
             prefix,
             replacements,
-            db_up_to_date: false,
             all_versions: None,
-        }
+        };
+        // NOTE we discard the result here as it's ok that this fails, which is expected if the database doesn't exist
+        // This just allows the version info to be available
+        let _ = p.update_available_versions();
+        p
     }
 
     pub fn get_database_path(&self) -> anyhow::Result<PathBuf> {
@@ -113,13 +121,8 @@ impl GitPackage {
     }
 
     pub fn update_db(&mut self) -> anyhow::Result<()> {
-        if !self.db_up_to_date {
-            self.clone_dependency_database()?;
-            self.db_up_to_date = true;
-        }
-        if self.all_versions.is_none() {
-            self.update_available_versions()?;
-        }
+        self.clone_dependency_database()?;
+        self.update_available_versions()?;
         Ok(())
     }
 
