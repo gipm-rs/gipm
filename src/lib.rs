@@ -46,61 +46,65 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
     let handle = gitoxide::shared::setup_line_renderer_range(&PROGRESS, progress_range.clone());
 
     // Phase 1: Update all dependency databases in parallel
-    let checkout_results: Vec<(&str, &str, anyhow::Result<()>)> = packages
+    let checkout_results: Vec<(&str, &str, GitPackage, anyhow::Result<()>)> = packages
         .par_iter()
-        .map(|(name, package)| -> (&str, &str, anyhow::Result<()>) {
-            let mut dep = GitPackage::new(
-                PackageUrl::GitUrl(package.source.clone()),
-                Some(name.clone()),
-                None,
-            );
-            let object = match package.commit.parse::<gix::ObjectId>() {
-                Ok(object) => object,
-                Err(e) => {
+        .map(
+            |(name, package)| -> (&str, &str, GitPackage, anyhow::Result<()>) {
+                let mut dep = GitPackage::new(
+                    PackageUrl::GitUrl(package.source.clone()),
+                    Some(name.clone()),
+                    None,
+                );
+                let object = match package.commit.parse::<gix::ObjectId>() {
+                    Ok(object) => object,
+                    Err(e) => {
+                        return (
+                            name,
+                            &package.commit,
+                            dep,
+                            Err(anyhow::anyhow!(format!(
+                                "Invalid commit hash {}: {e:?}",
+                                package.commit
+                            ))),
+                        );
+                    }
+                };
+                let should_update = dep.does_id_exist_in_db(object).unwrap_or(false);
+                if should_update && let Err(e) = dep.update_db() {
                     return (
                         name,
                         &package.commit,
-                        Err(anyhow::anyhow!(format!(
-                            "Invalid commit hash {}: {e:?}",
-                            package.commit
+                        dep,
+                        Err(e.context(format!(
+                            "Failed to update database for {} at commit {}",
+                            name, package.commit
                         ))),
                     );
-                }
-            };
-            let should_update = dep.does_id_exist_in_db(object).unwrap_or(false);
-            if should_update && let Err(e) = dep.update_db() {
-                return (
-                    name,
-                    &package.commit,
-                    Err(e.context(format!(
-                        "Failed to update database for {} at commit {}",
+                };
+                if *VERBOSE {
+                    println!(
+                        "Updating checkout for {} at commit {}",
                         name, package.commit
-                    ))),
-                );
-            };
-            if *VERBOSE {
-                println!(
+                    );
+                }
+
+                let mut sub_progress = PROGRESS.add_child(format!(
                     "Updating checkout for {} at commit {}",
                     name, package.commit
-                );
-            }
+                ));
 
-            let mut sub_progress = PROGRESS.add_child(format!(
-                "Updating checkout for {} at commit {}",
-                name, package.commit
-            ));
-
-            match dep.checkout_or_clone_object_from_database(object, &mut sub_progress) {
-                Ok(_) => {
-                    sub_progress.done("Complete");
-                    (name, &package.commit, Ok(()))
+                match dep.checkout_or_clone_object_from_database(object, &mut sub_progress) {
+                    Ok(_) => {
+                        sub_progress.done("Complete");
+                        (name, &package.commit, dep, Ok(()))
+                    }
+                    Err(e) => {
+                        sub_progress.fail(format!("Failed:\n\t{e:?}"));
+                        (name, &package.commit, dep, Err(e))
+                    }
                 }
-                Err(e) => {
-                    sub_progress.fail(format!("Failed:\n\t{e:?}"));
-                    (name, &package.commit, Err(e))
-                }
-            }
-        })
+            },
+        )
         .collect();
 
     handle.shutdown_and_wait();
@@ -108,10 +112,14 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
     let mut sync_success = true;
 
     println!("Synced dependencies:");
-    for (name, version, result) in checkout_results {
+    for (name, version, dep, result) in checkout_results {
         match result {
             Ok(_) => {
-                println!("  ✅ {name}: {version}");
+                if dep.is_dirty() {
+                    println!("  ❗ {}: {version} - dirty workspace", dep.name());
+                } else {
+                    println!("  ✅ {}: {version}", dep.name());
+                }
             }
             Err(e) => {
                 eprintln!("❌ Failed to check out {name} at version {version}: {e:?}");
@@ -196,12 +204,20 @@ pub fn install_dependencies() -> anyhow::Result<()> {
 
     println!("Resolved dependencies:");
     for (dep, version) in &resolved_dependencies {
-        if dep.name() != root_dep.clone().name() {
-            println!(
-                "  ✅ {}: {version} (tag {})",
-                dep.name(),
-                dep.get_tag_name(version).unwrap_or("invalid".to_string())
-            );
+        if let PackageUrl::GitUrl(_) = &dep.url {
+            if dep.is_dirty() {
+                println!(
+                    "  ❗ {}: {version} (tag {}) - dirty workspace",
+                    dep.name(),
+                    dep.get_tag_name(version).unwrap_or("invalid".to_string())
+                );
+            } else {
+                println!(
+                    "  ✅ {}: {version} (tag {})",
+                    dep.name(),
+                    dep.get_tag_name(version).unwrap_or("invalid".to_string())
+                );
+            }
         }
     }
 
