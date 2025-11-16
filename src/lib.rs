@@ -7,9 +7,9 @@ pub mod resolver;
 use crate::git::GitPackage;
 use crate::git::PackageUrl;
 use anyhow::Context;
-use gix::progress::tree::Root;
 use lockfile::LockFile;
 use once_cell::sync::Lazy;
+use prodash::tree::Root;
 use pubgrub::Ranges;
 use pubgrub::resolve;
 use rayon::prelude::*;
@@ -24,9 +24,34 @@ use std::path::Path;
 pub mod third_party;
 
 static PROGRESS: Lazy<std::sync::Arc<Root>> = Lazy::new(|| {
-    let trace = false;
-    gitoxide::shared::progress_tree(trace)
+    prodash::tree::root::Options {
+        message_buffer_capacity: 200,
+        ..Default::default()
+    }
+    .into()
 });
+
+const DEFAULT_FRAME_RATE: f32 = 6.0;
+
+fn setup_line_renderer_range(
+    progress: &std::sync::Arc<prodash::tree::Root>,
+    levels: std::ops::RangeInclusive<prodash::progress::key::Level>,
+) -> prodash::render::line::JoinHandle {
+    prodash::render::line(
+        std::io::stderr(),
+        std::sync::Arc::downgrade(progress),
+        prodash::render::line::Options {
+            level_filter: Some(levels),
+            frames_per_second: DEFAULT_FRAME_RATE,
+            initial_delay: Some(std::time::Duration::from_millis(1000)),
+            timestamp: true,
+            throughput: true,
+            hide_cursor: true,
+            ..prodash::render::line::Options::default()
+        }
+        .auto_configure(prodash::render::line::StreamKind::Stderr),
+    )
+}
 
 pub static VERBOSE: Lazy<bool> = Lazy::new(|| {
     // Load configuration from file or environment
@@ -43,7 +68,7 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
         lockfile.packages.into_iter().collect();
 
     let progress_range: RangeInclusive<u8> = 1..=4;
-    let handle = gitoxide::shared::setup_line_renderer_range(&PROGRESS, progress_range.clone());
+    let handle = setup_line_renderer_range(&PROGRESS, progress_range);
 
     // Phase 1: Update all dependency databases in parallel
     let checkout_results: Vec<(&str, &str, GitPackage, anyhow::Result<()>)> = packages
@@ -155,7 +180,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     // Note turn false to true for tracing; maybe add to program args
 
     let progress_range: RangeInclusive<u8> = 1..=4;
-    let handle = gitoxide::shared::setup_line_renderer_range(&PROGRESS, progress_range.clone());
+    let handle = setup_line_renderer_range(&PROGRESS, progress_range);
 
     // Initialize the dependency resolver
     let mut resolver = GitDependencyProvider::default();
