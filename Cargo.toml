@@ -1,6 +1,6 @@
 [package]
 name = "gipm"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Gipm is a git package manager"
 license = "MIT"
@@ -14,8 +14,7 @@ path = "src/lib.rs"
 serde = ["pubgrub/serde", "semver/serde"]
 
 [dependencies]
-gix = { version = "^0.74.0", features = ["blocking-http-transport-reqwest"]}
-gitoxide = { version = "^0.46.0", default-features = false, features = ["max-pure"]}
+gix = { version = "^0.74.0", features = ["blocking-http-transport-reqwest-rust-tls", "progress-tree"]}
 anyhow = "^1.0"
 tokio = { version = "^1.0", features = ["full"] }
 serde = { version = "^1.0", features = ["derive"] }
@@ -29,6 +28,7 @@ once_cell = "^1.21"
 chrono = { version = "^0.4", features = ["serde"] }
 toml = "^0.9"
 clap = { version = "^4.0", features = ["derive"] }
+prodash = { version = "^30.0.1", features = ["render-line", "render-line-crossterm", "render-line-autoconfigure", "progress-tree", "progress-tree-log", "local-time", "signal-hook"] }
 
 # For semver_pubgrub
 zerocopy = { version = "0.8.14", features = ["derive"] }
