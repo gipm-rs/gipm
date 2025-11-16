@@ -791,13 +791,13 @@ impl GitPackage {
 
         let subs = repo.submodules()?;
         if let Some(submodules) = subs {
-            eprintln!(
+            sub_progress_checkout_overall.info(format!(
                 "Warning: submodule support is not yet fully implemented Submodules \
                 will be updated using the `git` cli. Detected submodules in {}:",
                 self.name()
-            );
+            ));
             for s in submodules {
-                eprintln!("  - {}", s.name());
+                sub_progress_checkout_overall.info(format!("  - {}", s.name()));
             }
 
             update_submodules(
@@ -876,16 +876,30 @@ impl GitPackage {
         {
             let subs = checkout_repo.submodules()?;
             if let Some(submodules) = subs {
-                eprintln!(
+                sub_progress_checkout.info(format!(
                     "Warning: submodule support is not yet fully implemented Submodules \
-                will be updated using the `git` cli. Detected submodules in {}:",
+                    will be updated using the `git` cli. Detected submodules in {}:",
                     self.name()
-                );
+                ));
                 for s in submodules {
-                    eprintln!("  - {}", s.name());
+                    sub_progress_checkout.info(format!("  - {}", s.name()));
                 }
 
                 sub_progress_checkout.info("updating submodules".to_string());
+
+                // Update the HEAD reference to point to the correct tag ref
+                // TODO handle this in one common place
+                let update = gix::refs::transaction::Change::Update {
+                    log: Default::default(),
+                    expected: gix::refs::transaction::PreviousValue::Any,
+                    new: commit.id.into(),
+                };
+
+                checkout_repo.edit_reference(gix::refs::transaction::RefEdit {
+                    change: update,
+                    name: "HEAD".try_into().expect("valid"),
+                    deref: false,
+                })?;
 
                 update_submodules(
                     checkout_repo
@@ -1117,6 +1131,7 @@ impl GitPackage {
             .expect("Failed to write index");
 
         // Update the HEAD reference to point to the correct tag ref
+        // TODO handle this in one common place
         let update = gix::refs::transaction::Change::Update {
             log: Default::default(),
             expected: gix::refs::transaction::PreviousValue::Any,
@@ -1129,16 +1144,21 @@ impl GitPackage {
             deref: false,
         })?;
 
+        let update_submodules_info_item = sub_progress.add_child_with_id(
+            "Update submodules".to_string(),
+            gix::clone::checkout::main_worktree::ProgressId::CheckoutFiles.into(),
+        );
+
         // Update submodules if any
         let subs = checkout_repo.submodules()?;
         if let Some(submodules) = subs {
-            eprintln!(
+            update_submodules_info_item.info(format!(
                 "Warning: submodule support is not yet fully implemented Submodules \
                 will be updated using the `git` cli. Detected submodules in {}:",
                 self.name()
-            );
+            ));
             for s in submodules {
-                eprintln!("  - {}", s.name());
+                update_submodules_info_item.info(format!("  - {}", s.name()));
             }
 
             update_submodules(
@@ -1228,6 +1248,7 @@ impl GitPackage {
                         )) {
                         Ok(_) => {
                             // Update the HEAD reference to point to the correct tag ref
+                            // TODO handle this in one common place
                             let update = gix::refs::transaction::Change::Update {
                                 log: Default::default(),
                                 expected: gix::refs::transaction::PreviousValue::Any,
@@ -1344,6 +1365,7 @@ impl GitPackage {
                 )) {
                 Ok(_) => {
                     // Update the HEAD reference to point to the correct tag ref
+                    // TODO handle this in one common place
                     let update = gix::refs::transaction::Change::Update {
                         log: Default::default(),
                         expected: gix::refs::transaction::PreviousValue::Any,
