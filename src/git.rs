@@ -105,6 +105,13 @@ impl GitPackage {
         self.all_versions.as_ref()
     }
 
+    pub fn is_dirty(&self) -> bool {
+        let repo = gix::open(self.get_checkout_path().expect("Repo must exist"))
+            .expect("Error opening repo");
+
+        repo.is_dirty().expect("Error determining repo dirtiness")
+    }
+
     pub fn update_db(&mut self) -> anyhow::Result<()> {
         if !self.db_up_to_date {
             self.clone_dependency_database()?;
@@ -1485,7 +1492,7 @@ pub fn normalize_url(url: &PackageUrl) -> String {
             let s = s.trim_end_matches('/');
 
             // Lowercase for case-insensitivity
-            s.to_ascii_lowercase()
+            s.to_lowercase()
         }
         PackageUrl::Root => "ROOT".to_string(),
     }
