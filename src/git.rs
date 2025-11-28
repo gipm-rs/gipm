@@ -90,17 +90,7 @@ impl GitPackage {
             url,
             prefix,
             replacements,
-            // all_versions: None,
         }
-        // NOTE we discard the result here as it's ok that this fails, which is expected if the database doesn't exist
-        // This just allows the version info to be available
-        // match &p.url {
-        //     PackageUrl::GitUrl(_) => {
-        //         let _ = p.update_cached_available_versions();
-        //     }
-        //     PackageUrl::Root => {}
-        // }
-        // p
     }
 
     pub fn get_database_path(&self) -> anyhow::Result<PathBuf> {
@@ -125,7 +115,6 @@ impl GitPackage {
 
     pub fn update_db(&mut self) -> anyhow::Result<()> {
         self.clone_dependency_database()?;
-        // self.update_cached_available_versions()?;
         Ok(())
     }
 
