@@ -153,6 +153,10 @@ impl DependencyProvider for GitDependencyProvider {
         package: &Self::P,
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
+        if package.url == PackageUrl::Root {
+            // The root package is a special case; it has no versions to choose from
+            return Ok(Some(Version::new(0, 0, 0)));
+        }
         println!(
             "Choosing version for package: {}, range: {range}",
             package.name()
@@ -168,7 +172,10 @@ impl DependencyProvider for GitDependencyProvider {
             Some(version) => Some(version),
             None => package
                 .get_available_versions()
-                .expect("Failed to get available versions")
+                .unwrap_or_else(|e| panic!("Should be able to get versions for package {}: {e}", package.name()))
+                // TODO: this second unwrap seems likely to be the source of some issues
+                // having None here should be valid. Consider handling it more gracefully.
+                .unwrap_or_else(|| panic!("Saw no available versions for package {}", package.name()))
                 .keys()
                 .filter(|v| range.contains(v))
                 .max()

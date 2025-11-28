@@ -260,7 +260,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
                         &dep.prefix,
                         &dep.replacements,
                     )?;
-                    deps_map.insert(git::normalize_url(&dep.url), req);
+                    deps_map.insert(git::normalize_url(&PackageUrl::GitUrl(dep_spec.url)), req);
                 }
             }
             let dependencies_to_add = if deps_map.is_empty() {
