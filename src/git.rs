@@ -58,12 +58,14 @@ impl Hash for PackageUrl {
 }
 
 #[derive(Debug, Clone, Eq)]
+
+// TODO: in the past the available versions were cached here
+// This caused issues with reliably getting the version info updated when needed
+// This could be re-introduced if this causes performance struggles.
 pub struct GitPackage {
     pub url: PackageUrl,
     pub prefix: Option<String>,
     pub replacements: Option<Vec<[String; 2]>>,
-    // Map of versions to tag names
-    all_versions: Option<HashMap<Version, String>>,
 }
 
 impl Hash for GitPackage {
@@ -84,16 +86,11 @@ impl GitPackage {
         prefix: Option<String>,
         replacements: Option<Vec<[String; 2]>>,
     ) -> Self {
-        let mut p = GitPackage {
+        GitPackage {
             url,
             prefix,
             replacements,
-            all_versions: None,
-        };
-        // NOTE we discard the result here as it's ok that this fails, which is expected if the database doesn't exist
-        // This just allows the version info to be available
-        let _ = p.update_available_versions();
-        p
+        }
     }
 
     pub fn get_database_path(&self) -> anyhow::Result<PathBuf> {
@@ -109,10 +106,6 @@ impl GitPackage {
         Ok(path)
     }
 
-    pub fn get_available_versions(&self) -> Option<&HashMap<Version, String>> {
-        self.all_versions.as_ref()
-    }
-
     pub fn is_dirty(&self) -> bool {
         let repo = gix::open(self.get_checkout_path().expect("Repo must exist"))
             .expect("Error opening repo");
@@ -122,7 +115,6 @@ impl GitPackage {
 
     pub fn update_db(&mut self) -> anyhow::Result<()> {
         self.clone_dependency_database()?;
-        self.update_available_versions()?;
         Ok(())
     }
 
@@ -190,9 +182,9 @@ impl GitPackage {
     }
 
     pub fn get_tag_name(&self, version: &Version) -> Option<String> {
-        match &self.all_versions {
-            None => None,
-            Some(map) => map.get(version).cloned(),
+        match self.get_available_versions() {
+            Ok(v) => v.get(version).cloned(),
+            Err(_) => None
         }
     }
 
@@ -277,14 +269,14 @@ impl GitPackage {
     }
 
     /// Get all available versions from a git package
-    pub fn update_available_versions(&mut self) -> Result<&HashMap<Version, String>> {
+    pub fn get_available_versions(&self) -> anyhow::Result<HashMap<Version, String>> {
         let db_path = self.get_database_path()?;
 
         if !db_path.exists() {
             anyhow::bail!("Database for dependency {} does not exist", self.name());
         }
 
-        self.all_versions = Some(HashMap::new());
+        let mut all_versions: HashMap<Version, String> = HashMap::new();
 
         let db_repo = gix::open(&db_path)?;
         let mut tag_names = Vec::new();
@@ -339,25 +331,13 @@ impl GitPackage {
                 if *VERBOSE {
                     println!("Extracted version {version} from tag {tag}");
                 }
-                match &mut self.all_versions {
-                    None => {
-                        anyhow::bail!(
-                            "all_versions not initialized, must have been by this function"
-                        );
-                    }
-                    Some(map) => {
-                        map.insert(version, tag.to_string());
-                    }
-                }
+                all_versions.insert(version, tag.to_string());
             } else if *VERBOSE {
                 println!("Failed to extract version from tag: {tag}");
             }
         }
 
-        Ok(self
-            .all_versions
-            .as_ref()
-            .expect("all_versions not initialized, must have been by this function"))
+        Ok(all_versions)
     }
 
     /// Extract version from a tag name, using flexible separators and optional v prefix
