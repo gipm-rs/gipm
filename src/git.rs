@@ -182,13 +182,8 @@ impl GitPackage {
     }
 
     pub fn get_tag_name(&self, version: &Version) -> Option<String> {
-        match &self.get_available_versions() {
-            Ok(v) => {
-                match v {
-                    None => None,
-                    Some(map) => map.get(version).cloned()
-                }
-            }, 
+        match self.get_available_versions() {
+            Ok(v) => v.get(version).cloned(),
             Err(_) => None
         }
     }
@@ -274,14 +269,14 @@ impl GitPackage {
     }
 
     /// Get all available versions from a git package
-    pub fn get_available_versions(&self) -> anyhow::Result<Option<HashMap<Version, String>>> {
+    pub fn get_available_versions(&self) -> anyhow::Result<HashMap<Version, String>> {
         let db_path = self.get_database_path()?;
 
         if !db_path.exists() {
             anyhow::bail!("Database for dependency {} does not exist", self.name());
         }
 
-        let mut all_versions: Option<HashMap<Version, String>> = Some(HashMap::new());
+        let mut all_versions: HashMap<Version, String> = HashMap::new();
 
         let db_repo = gix::open(&db_path)?;
         let mut tag_names = Vec::new();
@@ -336,16 +331,7 @@ impl GitPackage {
                 if *VERBOSE {
                     println!("Extracted version {version} from tag {tag}");
                 }
-                match &mut all_versions {
-                    None => {
-                        anyhow::bail!(
-                            "all_versions not initialized, must have been by this function"
-                        );
-                    }
-                    Some(map) => {
-                        map.insert(version, tag.to_string());
-                    }
-                }
+                all_versions.insert(version, tag.to_string());
             } else if *VERBOSE {
                 println!("Failed to extract version from tag: {tag}");
             }

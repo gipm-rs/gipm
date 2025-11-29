@@ -173,9 +173,6 @@ impl DependencyProvider for GitDependencyProvider {
             None => package
                 .get_available_versions()
                 .unwrap_or_else(|e| panic!("Should be able to get versions for package {}: {e}", package.name()))
-                // TODO: this second unwrap seems likely to be the source of some issues
-                // having None here should be valid. Consider handling it more gracefully.
-                .unwrap_or_else(|| panic!("Saw no available versions for package {}", package.name()))
                 .keys()
                 .filter(|v| range.contains(v))
                 .max()
