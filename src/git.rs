@@ -17,9 +17,9 @@ use std::fmt;
 use std::fmt::Display;
 use std::fs::{create_dir_all, metadata, remove_dir_all, remove_file, set_permissions};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
-use std::io::Read;
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +98,25 @@ impl GitPackage {
         p
     }
 
+    /// Make sure the cached database exists and can actually be used, re-cloning it
+    /// when the cached directory is the residue of an interrupted fetch: such a
+    /// directory opens as a repository and even holds objects, but it has no
+    /// references, so every later run fails on a sha upstream still has.
+    pub fn ensure_usable_database(&self) -> anyhow::Result<()> {
+        let path = self.get_database_path()?;
+
+        if database_is_usable(&path) {
+            return Ok(());
+        }
+
+        if path.exists() {
+            remove_dir_all(&path)
+                .context(format!("Failed to remove unusable database at {path:?}",))?;
+        }
+
+        self.clone_dependency_database()
+    }
+
     pub fn get_database_path(&self) -> anyhow::Result<PathBuf> {
         let normalized = normalize_url(&self.url);
 
@@ -146,7 +165,7 @@ impl GitPackage {
     ) -> Result<Option<Vec<DependencySpecification>>> {
         let db_path = self.get_database_path()?;
 
-        if !db_path.exists() {
+        if !database_is_usable(&db_path) {
             // If database doesn't exist, we can't check for transitive deps. A database should always exist.
 
             // TODO: figure out where the clone should happen if we don't have a database.
@@ -216,7 +235,7 @@ impl GitPackage {
 
     pub fn does_id_exist_in_db(&self, object: impl Into<ObjectId>) -> anyhow::Result<bool> {
         let db_path = self.get_database_path()?;
-        if !db_path.exists() {
+        if !database_is_usable(&db_path) {
             return Ok(false);
         }
 
@@ -240,7 +259,7 @@ impl GitPackage {
 
     pub fn does_ref_exist_in_db(&self, reference: &str) -> anyhow::Result<bool> {
         let db_path = self.get_database_path()?;
-        if !db_path.exists() {
+        if !database_is_usable(&db_path) {
             return Ok(false);
         }
 
@@ -282,7 +301,7 @@ impl GitPackage {
     pub fn update_available_versions(&mut self) -> Result<&HashMap<Version, String>> {
         let db_path = self.get_database_path()?;
 
-        if !db_path.exists() {
+        if !database_is_usable(&db_path) {
             anyhow::bail!("Database for dependency {} does not exist", self.name());
         }
 
@@ -443,7 +462,9 @@ impl GitPackage {
         let path = self.get_database_path().expect("Could not get db path");
         debug!("Database path for {}: {:?}", self.name(), path);
 
-        if let Ok(repo) = gix::open(&path) {
+        if let Ok(repo) = gix::open(&path)
+            && database_is_usable(&path)
+        {
             debug!("Found existing database at {path:?}");
             // Open existing repository and fetch updates
             let remote = repo
@@ -453,8 +474,7 @@ impl GitPackage {
 
             let start = Instant::now();
 
-            let mut update_progress_overall =
-                progress::child(format!("{} db fetch", self.name()));
+            let mut update_progress_overall = progress::child(format!("{} db fetch", self.name()));
 
             let mut sub_progress_fetch = update_progress_overall.add_child("fetch".to_string());
 
@@ -485,6 +505,13 @@ impl GitPackage {
 
             Ok(())
         } else {
+            // A directory that opens but carries no references is the residue of an
+            // interrupted clone; it has to go before the re-clone, or the next run
+            // inherits the same half-written database.
+            if path.exists() {
+                remove_dir_all(&path).expect("Failed to remove unusable database directory");
+            }
+
             // First make the directory
             create_dir_all(&path).expect("Failed to create database clone directory");
             let url = gix::url::parse(self.url.as_str().into()).expect("Failed to parse URL");
@@ -710,15 +737,8 @@ impl GitPackage {
         }
 
         // TODO: This could be made more efficient for syncs by only cloning the one ref we need to the database repo
-        let db_repo = match gix::open(&bare_db_path) {
-            Ok(repo) => repo,
-            Err(_) => {
-                self.clone_dependency_database().context(format!(
-                    "Failed to open database repository at {bare_db_path:?}"
-                ))?;
-                gix::open(&bare_db_path)?
-            }
-        };
+        self.ensure_usable_database()?;
+        let db_repo = gix::open(&bare_db_path)?;
 
         // Check if the object exists in the database
         if db_repo.try_find_object(object)?.is_none() {
@@ -786,7 +806,9 @@ impl GitPackage {
         let subs = repo.submodules()?;
         let names: Vec<String> = match subs {
             None => vec![],
-            Some(list) => list.map(|s| format!("{}", s.name())).collect::<Vec<String>>(),
+            Some(list) => list
+                .map(|s| format!("{}", s.name()))
+                .collect::<Vec<String>>(),
         };
 
         if !names.is_empty() {
@@ -878,7 +900,9 @@ impl GitPackage {
             let subs = checkout_repo.submodules()?;
             let names: Vec<String> = match subs {
                 None => vec![],
-                Some(list) => list.map(|s| format!("{}", s.name())).collect::<Vec<String>>(),
+                Some(list) => list
+                    .map(|s| format!("{}", s.name()))
+                    .collect::<Vec<String>>(),
             };
 
             if !names.is_empty() {
@@ -1155,7 +1179,9 @@ impl GitPackage {
         let subs = checkout_repo.submodules()?;
         let names: Vec<String> = match subs {
             None => vec![],
-            Some(list) => list.map(|s| format!("{}", s.name())).collect::<Vec<String>>(),
+            Some(list) => list
+                .map(|s| format!("{}", s.name()))
+                .collect::<Vec<String>>(),
         };
 
         if !names.is_empty() {
@@ -1178,7 +1204,7 @@ impl GitPackage {
                 names.clone(),
                 Some(sub_progress),
             )
-                .context("submodule update failed")?;
+            .context("submodule update failed")?;
         };
 
         Ok(())
@@ -1187,7 +1213,7 @@ impl GitPackage {
     pub fn checkout_from_database(&self, version: &Version) -> anyhow::Result<()> {
         // Path to the bare database repository
         let bare_db_path = self.get_database_path()?;
-        if !bare_db_path.exists() {
+        if !database_is_usable(&bare_db_path) {
             anyhow::bail!("Database for does not exist at {:?}", bare_db_path);
         }
 
@@ -1429,6 +1455,42 @@ impl fmt::Display for GitPackage {
     }
 }
 
+/// A cached database is only usable when it opens as a repository *and* at least
+/// one of its references still resolves to an object we actually hold. An
+/// interrupted fetch leaves a directory that opens happily but carries no refs,
+/// or refs whose targets were never downloaded, and trusting either is what made
+/// later runs report "Object ... does not exist in the database" for a sha that
+/// upstream still publishes.
+pub fn database_is_usable(path: &PathBuf) -> bool {
+    let db_repo = match gix::open(path) {
+        Err(_) => return false,
+        Ok(db_repo) => db_repo,
+    };
+
+    let platform = match db_repo.references() {
+        Err(_) => return false,
+        Ok(platform) => platform,
+    };
+
+    let refs = match platform.all() {
+        Err(_) => return false,
+        Ok(refs) => refs,
+    };
+
+    for maybe_ref in refs {
+        if let Ok(reference) = &maybe_ref
+            && let Some(oid) = reference.target().try_id()
+        {
+            let object: gix::ObjectId = oid.into();
+            if let Ok(Some(_)) = db_repo.try_find_object(object) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 pub fn normalize_url(url: &PackageUrl) -> String {
     // Try to parse as a URL to handle userinfo (username:token@)
     // If parsing fails, fallback to manual normalization
@@ -1498,7 +1560,10 @@ pub fn normalize_url(url: &PackageUrl) -> String {
 /// the carry-over would miss or double-count every line that straddles a read boundary.
 pub fn count_fetch_lines(pending: &str, chunk: &[u8]) -> (usize, String) {
     let text: String = format!("{}{}", pending, String::from_utf8_lossy(chunk));
-    let lines: Vec<String> = text.split('\n').map(|line| line.to_string()).collect::<Vec<String>>();
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| line.to_string())
+        .collect::<Vec<String>>();
     let tail: String = lines[lines.len() - 1].to_string();
 
     let mut hits: usize = 0;
@@ -1511,7 +1576,12 @@ pub fn count_fetch_lines(pending: &str, chunk: &[u8]) -> (usize, String) {
     (hits, tail)
 }
 
-fn update_submodules(git_dir: &str, name: String, submodules: Vec<String>, parent: Option<&mut Item>) -> anyhow::Result<()> {
+fn update_submodules(
+    git_dir: &str,
+    name: String,
+    submodules: Vec<String>,
+    parent: Option<&mut Item>,
+) -> anyhow::Result<()> {
     // Nested under the package bar when one is available, its own line otherwise: a
     // submodule download must never be a silent stretch of the run. The parameter is not
     // called `progress` so the `progress::child` fallback below can stay readable.
@@ -1581,8 +1651,12 @@ fn update_submodules(git_dir: &str, name: String, submodules: Vec<String>, paren
                         pending_err = tail;
                         fetched += hits;
 
-                        subprogress.set(if fetched > submodules.len() { submodules.len() } else { fetched });
-                    },
+                        subprogress.set(if fetched > submodules.len() {
+                            submodules.len()
+                        } else {
+                            fetched
+                        });
+                    }
                     Err(_) => err_eof = true,
                 }
 
@@ -1602,7 +1676,7 @@ fn update_submodules(git_dir: &str, name: String, submodules: Vec<String>, paren
                     Ok(count) => {
                         out_chunk.truncate(count);
                         out_bytes.extend(out_chunk.iter());
-                    },
+                    }
                     Err(_) => out_eof = true,
                 }
 
@@ -1618,13 +1692,19 @@ fn update_submodules(git_dir: &str, name: String, submodules: Vec<String>, paren
         fetched += 1;
     }
 
-    let status = proc.wait().context("Failed to wait for git submodule update")?;
+    let status = proc
+        .wait()
+        .context("Failed to wait for git submodule update")?;
 
     let stderr_text: String = String::from_utf8_lossy(&err_bytes).trim().to_string();
     let stdout_text: String = String::from_utf8_lossy(&out_bytes).trim().to_string();
 
     if status.success() {
-        subprogress.done(format!("{} submodules fetched ({} requested)", fetched, submodules.len()));
+        subprogress.done(format!(
+            "{} submodules fetched ({} requested)",
+            fetched,
+            submodules.len()
+        ));
 
         if !stderr_text.is_empty() {
             debug!("git submodule update: {stderr_text}");
