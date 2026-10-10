@@ -4,15 +4,37 @@
 
 ## Installation
 
-- `cargo install gipm`
+Not on crates.io yet, so there is nothing to `cargo install` from the registry; build it from
+this repository instead:
+
+```sh
+git clone https://github.com/<you>/gipm.git
+cd gipm
+cargo build --release          # -> target/release/gipm(.exe) on Windows
+cargo install --path .         # once the package is published, `cargo install gipm` works
+```
 
 ## Use
 
-- `gipm update` - updates packages
-- `gipm sync` - sync to lockfile versions
-- `gipm clean` - remove .gitvenv
+- `gipm update` - resolves and checks out packages
+- `gipm sync` - sync the `.gitvenv` checkouts to the `gipm.lock` versions
+- `gipm clean` - remove `.gitvenv`
 - `gipm --help` - show help
-- all commands can be run verbose with `-v|--verbose`.
+
+### Output control
+
+Logs go to `stderr`, the result summary goes to `stdout`, so `gipm update 2>/dev/null` gives
+you just the table. Progress bars are one line per package (plus an overall bar with a
+spinner) and are only drawn on a terminal; the summary table also shows the commit sha each
+resolved tag points at.
+
+- `-v` / `--verbose` (countable): `-v` info, `-vv` debug, `-vvv` trace (default is warn)
+- `-q` / `--quiet`: only report errors, also suppresses progress bars
+- `--log-level <level>`: explicit level (`off`, `error`, `warn`, `info`, `debug`, `trace`), wins over `-v`
+- `RUST_LOG` is honoured when no verbosity flags are given
+- `--color <auto|always|never>`: colour policy (default: colour only on a terminal)
+- `--plain`: strip colour and cursor control, and draw no bars at all (safe for `cmd.exe`, log files, CI)
+- `--no-progress`: suppress progress bars (logs and the summary are still printed)
 
 ## How does `gipm` work?
 
@@ -114,6 +136,6 @@ For most repositories, `gipm` can automatically infer common replacements for se
 ## Limitations
 
 - This tool requires dependencies follow [semantic versioning](https://semver.org/) practices on their git repositories, and manage a **consistent tag format** that represents each release. This is best practice and generally adhered to across most repositories.
-- Dependencies with git submdodules may define the system in such a way that multiple copies of a dependency exists in your workspace (i.e. one copy in .gitvenv, and one as a submodule of a dependency). There is no way around this currently.
+- Dependencies with git submodules may define the system in such a way that multiple copies of a dependency exists in your workspace (i.e. one copy in .gitvenv, and one as a submodule of a dependency). There is no way around this currently.
 - Beware of pitfalls with yaml specifications - [the yaml document from hell](https://ruudvanasseldonk.com/2023/01/11/the-yaml-document-from-hell) is a good read
   - Note: YAML may be rethunk here in the future, but it is nice for its ease of reading for the user.

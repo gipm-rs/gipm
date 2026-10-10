@@ -1,9 +1,10 @@
 use crate::dependency::{
     dependency_spec_to_package_and_version_range, parse_dependencies_yaml_file,
 };
-use crate::git::GitPackage;
-use crate::git::PackageUrl;
+use crate::git::{normalize_url, GitPackage, PackageUrl};
+use crate::logging;
 use anyhow::Result;
+use log::{trace, warn};
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, Map, PackageResolutionStatistics,
     Ranges,
@@ -21,7 +22,7 @@ type VS = Ranges<Version>;
 
 struct DependencyCache {
     dependencies: Map<GitPackage, BTreeMap<Version, DependencyConstraints<GitPackage, VS>>>,
-    dbs_updated: HashMap<PackageUrl, bool>,
+    dbs_updated: HashMap<String, bool>,
 }
 
 impl DependencyCache {
@@ -62,9 +63,12 @@ impl DependencyCache {
             PackageUrl::GitUrl(_) => match package.fetch_dependencies_yaml(version) {
                 Ok(p) => p,
                 Err(e) => {
-                    println!(
-                        "Unable to get dependencies for {} version {version}. This version cannot be chosen:\n\t{e}",
-                        package.name(),
+                    // A missing dependencies.yaml is a transport/authoring failure, not a
+                    // resolution decision: it must be visible by default, otherwise the
+                    // user only ever sees "There is no solution".
+                    warn!(
+                        "Unable to get dependencies for {} version {version}. This version cannot be chosen: {}",
+                        package.name(), logging::error_text(&e),
                     );
                     return Ok(Dependencies::Unavailable(e.to_string()));
                 }
@@ -75,33 +79,56 @@ impl DependencyCache {
         if let Some(dep_spec) = dep_spec {
             match dependency_spec_to_package_and_version_range(dep_spec) {
                 Ok(deps_vec) => {
-                    let mut deps_to_update = deps_vec
-                        .iter()
-                        .filter(|(dep, _)| {
-                            !self.dbs_updated.get(&dep.url).copied().unwrap_or(false)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    // Filter for dependencies that haven't had their DB updated yet.
+                    // Fix #3: Use normalized URL as the key to handle different url formats (ssh vs https)
+                    // ensuring effective deduplication.
+                    let mut deps_to_update: Vec<(GitPackage, VS)> = deps_vec.iter().filter(|&(dep, _)| !self.dbs_updated.contains_key(&normalize_url(&dep.url))).cloned()
+                        .collect();
 
-                    // Update databases in parallel
-                    deps_to_update.par_iter_mut().for_each(|(dep, _)| {
-                        dep.update_db().expect("Failed to update db");
-                    });
+                    // Update databases in parallel.
+                    // Note: the updated `GitPackage` values must be the ones handed back to
+                    // pubgrub (see below), otherwise `all_versions` stays `None` for freshly
+                    // cloned databases and `choose_version` panics in `get_available_versions`.
+                    if !deps_to_update.is_empty() {
+                        let update_results: Vec<anyhow::Result<()>> = deps_to_update
+                            .par_iter_mut()
+                            .map(|(dep, _)| dep.update_db())
+                            .collect();
 
-                    // Update the map of updated dbs, so we avoid redundant updates
-                    for (dep, _) in &deps_to_update {
-                        self.dbs_updated.insert(dep.url.clone(), true);
+                        // Update the map of updated dbs using normalized keys for future lookups.
+                        for ((dep, _), result) in deps_to_update.iter().zip(update_results.iter()) {
+                            if let Err(e) = result {
+                                let msg = format!(
+                                    "Failed to update database for {}: {e}",
+                                    dep.name(),
+                                );
+                                warn!(
+                                    "Unable to update dependency database for {}: {}. This version cannot be chosen",
+                                    dep.name(), logging::error_text(e),
+                                );
+                                return Ok(Dependencies::Unavailable(msg));
+                            }
+                            self.dbs_updated.insert(normalize_url(&dep.url), true);
+                        }
                     }
+
+                    // Index the database-updated packages by normalized url so the constraints
+                    // we hand to pubgrub carry their resolved version information.
+                    let updated_deps: HashMap<String, GitPackage> = deps_to_update
+                        .iter()
+                        .map(|(dep, _)| (normalize_url(&dep.url), dep.clone()))
+                        .collect();
 
                     // Constraints are handled post update
                     for (dep, vers) in &deps_vec {
+                        let dep = updated_deps.get(&normalize_url(&dep.url)).unwrap_or(dep);
                         constraints.insert(dep.clone(), vers.clone());
                     }
                 }
                 Err(e) => {
-                    println!(
-                        "Unable to resolve version range for package {} version {version}. This version cannot be chosen:\n\t{e}",
-                        package.name(),
+                    warn!(
+                        "Unable to resolve version range for package {} version {version}. This version cannot be chosen: {}",
+                        package.name(), logging::error_text(&e),
                     );
                     return Ok(Dependencies::Unavailable(e.to_string()));
                 }
@@ -153,10 +180,7 @@ impl DependencyProvider for GitDependencyProvider {
         package: &Self::P,
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
-        println!(
-            "Choosing version for package: {}, range: {range}",
-            package.name()
-        );
+        trace!("Choosing version for package: {}, range: {range}", package.name());
 
         let version = match self
             .cache
@@ -176,8 +200,8 @@ impl DependencyProvider for GitDependencyProvider {
         };
 
         match &version {
-            Some(v) => println!("Package: {}, version: {v}", package.name()),
-            None => println!("No available versions for package {}", package.name()),
+            Some(v) => trace!("Package: {}, version: {v}", package.name()),
+            None => trace!("No available versions for package {}", package.name()),
         }
 
         Ok(version)

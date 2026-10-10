@@ -2,64 +2,25 @@
 
 pub mod dependency;
 pub mod git;
+pub mod logging;
+pub mod progress;
 pub mod lockfile;
 pub mod resolver;
 use crate::git::GitPackage;
 use crate::git::PackageUrl;
 use anyhow::Context;
 use lockfile::LockFile;
-use once_cell::sync::Lazy;
-use prodash::tree::Root;
+use log::{error, info};
 use pubgrub::Ranges;
 use pubgrub::resolve;
 use rayon::prelude::*;
 use resolver::GitDependencyProvider;
 use semver::Version;
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::iter::zip;
-use std::ops::RangeInclusive;
 use std::path::Path;
 pub mod third_party;
-
-static PROGRESS: Lazy<std::sync::Arc<Root>> = Lazy::new(|| {
-    prodash::tree::root::Options {
-        message_buffer_capacity: 200,
-        ..Default::default()
-    }
-    .into()
-});
-
-const DEFAULT_FRAME_RATE: f32 = 6.0;
-
-fn setup_line_renderer_range(
-    progress: &std::sync::Arc<prodash::tree::Root>,
-    levels: std::ops::RangeInclusive<prodash::progress::key::Level>,
-) -> prodash::render::line::JoinHandle {
-    prodash::render::line(
-        std::io::stderr(),
-        std::sync::Arc::downgrade(progress),
-        prodash::render::line::Options {
-            level_filter: Some(levels),
-            frames_per_second: DEFAULT_FRAME_RATE,
-            initial_delay: Some(std::time::Duration::from_millis(1000)),
-            timestamp: true,
-            throughput: true,
-            hide_cursor: true,
-            ..prodash::render::line::Options::default()
-        }
-        .auto_configure(prodash::render::line::StreamKind::Stderr),
-    )
-}
-
-pub static VERBOSE: Lazy<bool> = Lazy::new(|| {
-    // Load configuration from file or environment
-
-    // This is kinda nasty and this shuold be replaced with a proper logging implementation.
-    // Note this is tied to the verbose flag in the main method.
-    env::args().any(|arg| arg == "-v" || arg == "--verbose")
-});
 
 pub fn sync_dependencies() -> anyhow::Result<()> {
     let lockfile = LockFile::from_file("gipm.lock")?;
@@ -67,8 +28,7 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
     let packages: Vec<(String, lockfile::LockFilePackage)> =
         lockfile.packages.into_iter().collect();
 
-    let progress_range: RangeInclusive<u8> = 1..=4;
-    let handle = setup_line_renderer_range(&PROGRESS, progress_range);
+    let handle = progress::start(packages.len());
 
     // Phase 1: Update all dependency databases in parallel
     let checkout_results: Vec<(&str, &str, GitPackage, anyhow::Result<()>)> = packages
@@ -106,25 +66,23 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
                         ))),
                     );
                 };
-                if *VERBOSE {
-                    println!(
-                        "Updating checkout for {} at commit {}",
-                        name, package.commit
-                    );
-                }
-
-                let mut sub_progress = PROGRESS.add_child(format!(
+                let label: String = format!(
                     "Updating checkout for {} at commit {}",
                     name, package.commit
-                ));
+                );
+                info!("{}", label);
+
+                let mut sub_progress = progress::child(name.to_string());
 
                 match dep.checkout_or_clone_object_from_database(object, &mut sub_progress) {
                     Ok(_) => {
                         sub_progress.done("Complete");
+                        progress::task_done(name.to_string());
                         (name, &package.commit, dep, Ok(()))
                     }
                     Err(e) => {
-                        sub_progress.fail(format!("Failed:\n\t{e:?}"));
+                        sub_progress.fail(format!("Failed: {}", logging::error_text(&e)));
+                        progress::task_done(name.to_string());
                         (name, &package.commit, dep, Err(e))
                     }
                 }
@@ -134,34 +92,46 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
 
     handle.shutdown_and_wait();
 
+    let mut rows: Vec<logging::SummaryRow> = vec![];
     let mut sync_success = true;
 
-    println!("Synced dependencies:");
     for (name, version, dep, result) in checkout_results {
         match result {
             Ok(_) => {
-                if dep.is_dirty() {
-                    println!("  ❗ {}: {version} - dirty workspace", dep.name());
+                let status: String = if dep.is_dirty() {
+                    logging::sym_dirty()
                 } else {
-                    println!("  ✅ {}: {version}", dep.name());
-                }
+                    logging::sym_ok()
+                };
+
+                rows.push(
+                    logging::SummaryRow {
+                        name: dep.name(),
+                        version: "".to_string(),
+                        tag: "".to_string(),
+                        commit: version.to_string(),
+                        status,
+                    }
+                );
             }
             Err(e) => {
-                eprintln!("❌ Failed to check out {name} at version {version}: {e:?}");
+                error!(
+                    "Failed to check out {} at commit {}: {}",
+                    name, version, logging::error_text(&e)
+                );
                 sync_success = false;
             }
         }
     }
 
-    match sync_success {
-        true => {
-            println!("✅ All dependencies synced successfully!");
-            Ok(())
-        }
-        false => Err(anyhow::anyhow!(
-            "❌ Some dependencies failed to sync. See above log for details."
-        )),
+    logging::render_summary("Synced dependencies".to_string(), rows);
+
+    if sync_success {
+        logging::result("All dependencies synced successfully".to_string());
+        return Ok(());
     }
+
+    Err(anyhow::anyhow!("Some dependencies failed to sync; see the log above for details."))
 }
 
 // Clean up any resolved dependencies. This only affects. gitvenv, not the gipm.lock file.
@@ -169,18 +139,14 @@ pub fn clean() -> anyhow::Result<()> {
     let git_deps_dir = Path::new(".gitvenv");
     if git_deps_dir.exists() {
         fs::remove_dir_all(git_deps_dir)?;
-        println!("Deleted .gitvenv directory");
+        logging::result("Deleted .gitvenv directory".to_string());
     }
 
     Ok(())
 }
 
 pub fn install_dependencies() -> anyhow::Result<()> {
-    // Initialize progress
-    // Note turn false to true for tracing; maybe add to program args
-
-    let progress_range: RangeInclusive<u8> = 1..=4;
-    let handle = setup_line_renderer_range(&PROGRESS, progress_range);
+    let handle = progress::start(0);
 
     // Initialize the dependency resolver
     let mut resolver = GitDependencyProvider::default();
@@ -202,47 +168,63 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     );
 
     // Resolve all dependencies
-    let mut resolved_dependencies = resolve(&resolver, root_dep.clone(), dummy_root_version)?;
+    let mut resolved_dependencies =
+        resolve(&resolver, root_dep.clone(), dummy_root_version)
+            .context(
+                "No version selection satisfies the ranges in dependencies.yaml (the solver's reasoning is logged at -v)",
+            )?;
 
     // Remove the root dependency, as it is not an item to be checked out.
     resolved_dependencies.remove(&root_dep);
+
+    // Now that the graph is solved, the overall bar has an honest denominator.
+    progress::set_expected(resolved_dependencies.len());
 
     // Checkout all resolved dependencies in parallel
     let result: Vec<anyhow::Result<()>> = resolved_dependencies
         .par_iter()
         .map(|(dep, version)| {
-            if *VERBOSE {
-                println!("Checking out {} at version {version}", dep.name());
-            }
-            dep.checkout_from_database(version)
+            info!("Checking out {} at version {}", dep.name(), version);
+            let outcome: anyhow::Result<()> = dep.checkout_from_database(version);
+            progress::task_done(dep.name());
+            outcome
         })
         .collect();
 
     handle.shutdown_and_wait();
 
-    // Report errors in the checkout
-    for (result, (dep, ver)) in zip(&result, &resolved_dependencies) {
-        if let Err(e) = result {
-            anyhow::bail!("Error checking out - {} version {ver}: {e}", dep.name())
+    let mut rows: Vec<logging::SummaryRow> = vec![];
+    for (dep, version) in &resolved_dependencies {
+        if let PackageUrl::GitUrl(_) = &dep.url {
+            let status: String = if dep.is_dirty() {
+                logging::sym_dirty()
+            } else {
+                logging::sym_ok()
+            };
+
+            let commit: String = dep.get_commit_hash_for_version(version).unwrap_or("".to_string());
+
+            rows.push(
+                logging::SummaryRow {
+                    name: dep.name(),
+                    version: version.to_string(),
+                    tag: dep.get_tag_name(version).unwrap_or("invalid".to_string()),
+                    commit: commit.clone(),
+                    status,
+                }
+            );
         }
     }
 
-    println!("Resolved dependencies:");
-    for (dep, version) in &resolved_dependencies {
-        if let PackageUrl::GitUrl(_) = &dep.url {
-            if dep.is_dirty() {
-                println!(
-                    "  ❗ {}: {version} (tag {}) - dirty workspace",
-                    dep.name(),
-                    dep.get_tag_name(version).unwrap_or("invalid".to_string())
-                );
-            } else {
-                println!(
-                    "  ✅ {}: {version} (tag {})",
-                    dep.name(),
-                    dep.get_tag_name(version).unwrap_or("invalid".to_string())
-                );
-            }
+    logging::render_summary("Resolved dependencies".to_string(), rows);
+
+    // Report errors in the checkout *after* the table: a partial failure must still show
+    // what did resolve, the same way `sync` does.
+    for (result, (dep, ver)) in zip(&result, &resolved_dependencies) {
+        if let Err(e) = result {
+            return Err(
+                anyhow::anyhow!("Error checking out - {} version {ver}: {e}", dep.name()),
+            )
         }
     }
 
@@ -257,10 +239,13 @@ pub fn install_dependencies() -> anyhow::Result<()> {
                 for dep_spec in deps {
                     let req = dep.parse_version_requirement(
                         &dep_spec.version,
-                        &dep.prefix,
-                        &dep.replacements,
+                        &dep_spec.prefix,
+                        &dep_spec.replacement,
                     )?;
-                    deps_map.insert(git::normalize_url(&dep.url), req);
+                    deps_map.insert(
+                        git::normalize_url(&PackageUrl::GitUrl(dep_spec.url.clone())),
+                        req,
+                    );
                 }
             }
             let dependencies_to_add = if deps_map.is_empty() {
@@ -280,8 +265,8 @@ pub fn install_dependencies() -> anyhow::Result<()> {
 
     lockfile.to_file("gipm.lock")?;
 
-    println!("✅ All dependencies resolved and checked out successfully!");
-    println!("🔒 Lockfile updated at gipm.lock");
+    logging::result("All dependencies resolved and checked out successfully".to_string());
+    logging::result("Lockfile updated at gipm.lock".to_string());
 
     Ok(())
 }
