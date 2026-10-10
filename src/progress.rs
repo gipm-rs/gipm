@@ -9,23 +9,23 @@
 //!
 //! Nothing outside this module touches `prodash`, `indicatif` or `console`.
 
-use once_cell::sync::Lazy;
+use console::Term;
 use crossterm::tty::IsTty;
-use console::{Term};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use prodash::messages::{Message, MessageLevel};
-use prodash::progress::{Key, Task};
-use prodash::progress::key::Level;
-use prodash::tree::Root;
 use gix::progress::prodash::tree::Item;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::io::stderr;
-use std::thread::{JoinHandle, sleep, spawn};
-use std::time::Duration;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use once_cell::sync::Lazy;
+use prodash::messages::{Message, MessageLevel};
+use prodash::progress::key::Level;
+use prodash::progress::{Key, Task, Value};
+use prodash::tree::Root;
 use std::cmp::max;
 use std::cmp::min;
+use std::io::stderr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::{JoinHandle, sleep, spawn};
+use std::time::Duration;
 
 const FRAME_MS: u64 = 100;
 const PREFIX_WIDTH: u16 = 22;
@@ -35,16 +35,25 @@ const MAX_BAR_WIDTH: u16 = 100;
 
 /// Braille dots, the usual "still working, unknown size" spinner. The last entry
 /// is the frame used once a task reports completion, so it repeats the first one.
-const SPINNER: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋",
-];
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋"];
 const MAX_TASKS: usize = 30;
+
+/// Ticks one sized prodash item contributes to its bar. Weighting stages equally
+/// instead of summing the raw counters is what keeps a bar honest: gix reports a fetch
+/// as thousands of files and the step around it as three actions, so a summed model
+/// reads 5001/5003 (100%) the moment the fetch finishes, while the worktree checkout
+/// that takes far longer has not even started.
+///
+/// 100 ticks per stage, so a stage's fraction lands on whole percent points and the
+/// drawing does not drift a percent away from the counter it came from.
+const STAGE_TICKS: u64 = 100;
 
 static PROGRESS: Lazy<Arc<Root>> = Lazy::new(|| {
     prodash::tree::root::Options {
         message_buffer_capacity: 400,
         ..Default::default()
-    }.into()
+    }
+    .into()
 });
 
 static RENDERER_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -62,7 +71,7 @@ static STDERR_TTY_KNOWN: AtomicBool = AtomicBool::new(false);
 /// `stderr`, so this is also the gate for "may I own the cursor".
 fn stderr_is_tty() -> bool {
     if STDERR_TTY_KNOWN.load(Ordering::Relaxed) {
-        return STDERR_TTY.load(Ordering::Relaxed)
+        return STDERR_TTY.load(Ordering::Relaxed);
     }
 
     // Resolved once: tty-ness cannot change mid-run, and the Windows implementation of
@@ -74,9 +83,7 @@ fn stderr_is_tty() -> bool {
     tty
 }
 
-static PENDING: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
-    Mutex::new(vec![])
-});
+static PENDING: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(vec![]));
 
 /// How many package-level tasks the running phase is expected to handle. The
 /// prodash tree only ever holds work that is *currently* running (items are
@@ -87,9 +94,13 @@ static EXPECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Package-level tasks that finished, name-deduped.
 static DONE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-static DONE_NAMES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
-    Mutex::new(vec![])
-});
+static DONE_NAMES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(vec![]));
+
+/// The prodash tree, the phase total and the finished-package counter are process
+/// wide, so the tests that drive them take the lock in turn; otherwise one test's
+/// items show up inside another test's frames.
+#[cfg(test)]
+static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Turns bar rendering on or off (`--no-progress`). Items keep being recorded so gix
 /// callbacks stay happy, they simply are not drawn.
@@ -153,6 +164,29 @@ pub struct BarSpec {
     pub done: bool,
 }
 
+/// Ticks one sized item contributes to its bar, out of `STAGE_TICKS`. Unsized items
+/// (gix's byte counters, and anything that never reported a total) contribute nothing:
+/// they cannot fake a finished bar, and a task whose only signal is unsized stays a
+/// spinner, which is the honest drawing.
+fn stage_of(value: &Value) -> (u64, u64) {
+    let step: u64 = value.step.load(Ordering::Relaxed) as u64;
+
+    if let Some(max) = &value.done_at {
+        let limit: u64 = *max as u64;
+
+        if limit > 0 {
+            // Round up, so a stage that has started is never drawn as not-started.
+            let ticks: u64 = step
+                .saturating_mul(STAGE_TICKS)
+                .saturating_add(limit - 1)
+                .saturating_div(limit);
+            return (min(ticks, STAGE_TICKS), STAGE_TICKS);
+        }
+    }
+
+    (0, 0)
+}
+
 /// Snapshot of the prodash tree folded into one entry per top-level item.
 fn collect_specs() -> Vec<BarSpec> {
     let mut tasks: Vec<(Key, Task)> = vec![];
@@ -178,26 +212,30 @@ fn collect_specs() -> Vec<BarSpec> {
             };
 
             if let Some(value) = &task.progress {
-                spec.current += value.step.load(Ordering::Relaxed) as u64;
-
-                if let Some(max) = &value.done_at {
-                    spec.total += *max as u64;
-                }
+                let (ticks, weight): (u64, u64) = stage_of(value);
+                spec.current += ticks;
+                spec.total += weight;
             }
 
             specs.push(spec);
         } else if level > 1 {
             for spec in specs.iter_mut() {
                 if key.shares_parent_with(&spec.key, 1) {
-                    if let Some(value) = &task.progress {
-                        spec.current += value.step.load(Ordering::Relaxed) as u64;
+                    let mut running: bool = true;
 
-                        if let Some(max) = &value.done_at {
-                            spec.total += *max as u64;
-                        }
+                    if let Some(value) = &task.progress {
+                        let (ticks, weight): (u64, u64) = stage_of(value);
+                        spec.current += ticks;
+                        spec.total += weight;
+                        running = weight == 0 || ticks < weight;
                     }
 
-                    spec.stage = task.name.clone();
+                    // Only a stage that is still moving may claim the message slot, so a
+                    // finished fetch cannot hide the fact that the checkout is what is
+                    // actually running.
+                    if running {
+                        spec.stage = task.name.clone();
+                    }
                 }
             }
         }
@@ -271,8 +309,7 @@ fn overall_style(term: Term) -> ProgressStyle {
 
     let template: String = format!(
         "{{prefix:>{}!.bold}} {{spinner:1.cyan}} {{bar:{}.cyan/blue}} {{percent:>3}}% {{elapsed}} {{msg:.cyan}}",
-        PREFIX_WIDTH,
-        bar_width,
+        PREFIX_WIDTH, bar_width,
     );
 
     match ProgressStyle::with_template(&template) {
@@ -285,7 +322,7 @@ fn overall_style(term: Term) -> ProgressStyle {
 pub struct Renderer {
     pub multi: MultiProgress,
     pub overall: ProgressBar,
-    pub bars: Vec<(Key, ProgressBar, BarSpec, u64)>,
+    pub bars: Vec<(Key, ProgressBar, BarSpec, u64, u64)>,
     pub total_seen: u64,
     pub done_seen: u64,
     pub style: ProgressStyle,
@@ -295,7 +332,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(multi: MultiProgress, style: ProgressStyle, done_style: ProgressStyle, spinner_style: ProgressStyle, overall_style: ProgressStyle) -> Renderer {
+    pub fn new(
+        multi: MultiProgress,
+        style: ProgressStyle,
+        done_style: ProgressStyle,
+        spinner_style: ProgressStyle,
+        overall_style: ProgressStyle,
+    ) -> Renderer {
         let overall: ProgressBar = multi.add(ProgressBar::no_length());
         overall.set_style(overall_style.clone());
 
@@ -325,7 +368,11 @@ impl Renderer {
         let drawn: usize = min(MAX_TASKS, specs.len());
 
         for spec in specs.iter().take(drawn) {
-            let index: usize = match self.bars.iter().position(|(key, _, _, _)| *key == spec.key) {
+            let index: usize = match self
+                .bars
+                .iter()
+                .position(|(key, _, _, _, _)| *key == spec.key)
+            {
                 Some(index) => index,
                 None => {
                     let bar: ProgressBar = if spec.total > 0 {
@@ -334,9 +381,10 @@ impl Renderer {
                         ProgressBar::no_length()
                     };
 
-                    self.bars.push((spec.key, self.multi.add(bar), spec.clone(), spec.total));
+                    self.bars
+                        .push((spec.key, self.multi.add(bar), spec.clone(), spec.total, 0));
                     self.bars.len() - 1
-                },
+                }
             };
 
             let was_done: bool = self.bars[index].2.done;
@@ -348,40 +396,62 @@ impl Renderer {
                 self.bars[index].2.done = true;
             }
 
-            self.bars[index].1.set_style(
-                if spec.done {
-                    self.done_style.clone()
-                } else if spec.total > 0 {
-                    self.style.clone()
-                } else {
-                    self.spinner_style.clone()
-                }
-            );
+            self.bars[index].1.set_style(if spec.done {
+                self.done_style.clone()
+            } else if spec.total > 0 {
+                self.style.clone()
+            } else {
+                self.spinner_style.clone()
+            });
             self.bars[index].1.set_prefix(spec.name.clone());
 
             if spec.total > 0 {
                 // A task's total can grow as more sub-steps show up (gix reports them
                 // lazily); never let the track shrink, that reads as lost progress.
-                let length: u64 = max(spec.total, self.bars[index].3);
+                let prev_length: u64 = self.bars[index].3;
+                let prev_position: u64 = self.bars[index].4;
+                let length: u64 = max(spec.total, prev_length);
                 self.bars[index].3 = length;
+
+                // A track that grew must not pull the fill back either, so the old fill
+                // is re-expressed against the new track before anything else is compared.
+                let base: u64 = if length > prev_length {
+                    prev_position.saturating_mul(length) / max(prev_length, 1)
+                } else {
+                    prev_position
+                };
+
+                // Counters only move forward. A stage that finished and then left the
+                // tree (its `Item` went out of scope) is no longer in the snapshot, and
+                // recomputing from the snapshot alone would pull the bar back.
+                let seen: u64 = max(base, min(spec.current, length));
+                self.bars[index].4 = seen;
+
+                // A running bar never reads 100%: every stage it knows about can be
+                // finished while the next one has not been discovered yet, and a full
+                // green bar there tells the user the work is over when it is not.
                 self.bars[index].1.set_length(length);
-                self.bars[index].1.set_position(min(spec.current, length));
+                self.bars[index].1.set_position(if spec.done {
+                    length
+                } else {
+                    min(seen, length - 1)
+                });
             } else if spec.done {
                 // Nothing ever reported a total for this task; a finished one still
                 // deserves a full bar rather than an empty track.
+                self.bars[index].3 = 1;
+                self.bars[index].4 = 1;
                 self.bars[index].1.set_length(1);
                 self.bars[index].1.set_position(1);
             }
 
             // A task's own message wins; otherwise show which sub-step is running so
             // a long clone does not look like the same bar sitting still.
-            self.bars[index].1.set_message(
-                if spec.status.is_empty() {
-                    spec.stage.clone()
-                } else {
-                    spec.status.clone()
-                }
-            );
+            self.bars[index].1.set_message(if spec.status.is_empty() {
+                spec.stage.clone()
+            } else {
+                spec.status.clone()
+            });
 
             if !spec.done && spec.total == 0 {
                 self.bars[index].1.tick();
@@ -391,7 +461,7 @@ impl Renderer {
         // Tasks that left the tree and never finished are gone: drop their bar.
         let mut index: usize = 0;
         while index < self.bars.len() {
-            let (key, _, spec, _) = &self.bars[index];
+            let (key, _, spec, _, _) = &self.bars[index];
             let alive: bool = specs.iter().any(|spec| spec.key == *key);
 
             if !alive && !spec.done {
@@ -402,8 +472,13 @@ impl Renderer {
             }
         }
 
-        let message_done: u64 = self.bars.iter().filter(|(_, _, spec, _)| spec.done).count() as u64;
-        let done: u64 = max(done_count(), message_done);
+        // Only package-level completions count toward the phase total. The tree also
+        // carries the auxiliary items named after their package (`zlib db fetch`,
+        // `zlib submodules`), and counting those here is what let the overall bar read
+        // 100% before a single package had been checked out — the bars then sat there
+        // green for the whole rest of the run.
+        let running: bool = self.bars.iter().any(|(_, _, spec, _, _)| !spec.done);
+        let done: u64 = done_count();
 
         // The prodash tree only ever holds work that is *currently* running, so it can
         // never be the denominator. Until the caller hands the real one over
@@ -415,31 +490,47 @@ impl Renderer {
         if expected == 0 {
             self.overall.set_style(self.spinner_style.clone());
             self.overall.set_prefix("total".to_string());
-            self.overall.set_message(
-                if specs.len() > drawn {
-                    format!("{} running, {} more", self.bars.len(), specs.len() - drawn)
-                } else {
-                    format!("{} running", self.bars.len())
-                },
-            );
-            return
+            self.overall.set_message(if specs.len() > drawn {
+                format!("{} running, {} more", self.bars.len(), specs.len() - drawn)
+            } else {
+                format!("{} running", self.bars.len())
+            });
+            return;
         }
 
         let total: u64 = expected;
 
-        self.done_seen = done;
-        self.total_seen = total;
+        // The spinner style above is sticky: once the phase has handed over its real
+        // denominator the bar has to be put back, or the line keeps the spinner
+        // template and the rule and the percentage are simply not drawn.
+        self.overall.set_style(self.overall_style.clone());
+
+        self.done_seen = max(done, self.done_seen);
+        self.total_seen = max(total, self.total_seen);
+
+        // The overall bar is monotonic too, and it does not read 100% while any bar is
+        // still moving: reaching the end of the count is not the same as the phase being
+        // over, and a full bar that sits there for another minute reads as a hang.
+        let position: u64 = min(self.done_seen, total);
+        let position: u64 = if running && position >= total {
+            total - 1
+        } else {
+            position
+        };
 
         self.overall.set_length(total);
-        self.overall.set_position(min(done, total));
+        self.overall.set_position(position);
         self.overall.set_prefix("total".to_string());
-        self.overall.set_message(
-            if specs.len() > drawn {
-                format!("{} of {} packages, {} bars not shown", done, total, specs.len() - drawn)
-            } else {
-                format!("{} of {} packages", done, total)
-            },
-        );
+        self.overall.set_message(if specs.len() > drawn {
+            format!(
+                "{} of {} packages, {} bars not shown",
+                position,
+                total,
+                specs.len() - drawn
+            )
+        } else {
+            format!("{} of {} packages", position, total)
+        });
     }
 
     /// Prints a log line above the bar block, keeping the cursor bookkeeping intact.
@@ -489,7 +580,7 @@ pub fn start(expected: usize) -> ProgressHandle {
     // No bars when `stderr` is not a terminal: indicatif would drop every frame anyway,
     // and the log lines that used to ride along with them would be dropped too.
     if !drawing() || bars_alive() {
-        return ProgressHandle { stop: None }
+        return ProgressHandle { stop: None };
     }
 
     DONE_COUNT.store(0, Ordering::Relaxed);
@@ -505,15 +596,13 @@ pub fn start(expected: usize) -> ProgressHandle {
     // The thread is deliberately detached: it exits as soon as `stop` flips, and
     // `stop_and_wait` waits for `RENDER_EXITED` instead of joining a handle it cannot
     // move out of a type that has a user-defined `Drop`.
-    let _thread: JoinHandle<()> = spawn(|| {
-        render_loop(shared)
-    });
+    let _thread: JoinHandle<()> = spawn(|| render_loop(shared));
 
     ProgressHandle { stop: Some(stop) }
 }
 
 pub struct ProgressHandle {
-    pub stop: Option<Arc<AtomicBool>>
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl ProgressHandle {
@@ -572,7 +661,7 @@ pub fn task_done(name: String) {
     let mut lock = DONE_NAMES.lock().unwrap();
 
     if lock.iter().any(|done| done == &name) {
-        return
+        return;
     }
 
     lock.push(name.clone());
@@ -591,8 +680,143 @@ pub fn subchild(parent: &mut Item, message: String) -> Item {
 
 #[cfg(test)]
 #[test]
+fn test_bar_pacing() -> anyhow::Result<()> {
+    use indicatif::{InMemoryTerm, ProgressDrawTarget};
+
+    let _hold = TEST_LOCK.lock();
+
+    let term: InMemoryTerm = InMemoryTerm::new(12, 200);
+    let target: ProgressDrawTarget = ProgressDrawTarget::term_like(Box::new(term.clone()));
+
+    let mut renderer: Renderer = Renderer::new(
+        MultiProgress::with_draw_target(target),
+        bar_style(Term::buffered_stderr(), false),
+        bar_style(Term::buffered_stderr(), true),
+        spinner_style(),
+        overall_style(Term::buffered_stderr()),
+    );
+
+    // One renderer across all frames, the way the render loop drives one across its
+    // repaints, so the monotonic rules are checked against a real bar history.
+    let mut frame_of = |label: String| -> String {
+        renderer.draw(collect_specs());
+
+        let out: String = term.contents();
+        eprintln!("--- {label} ---\n{out}");
+        out.to_string()
+    };
+
+    let line_with = |frame: String, needle: String| -> String {
+        frame
+            .split('\n')
+            .map(|line| line.to_string())
+            .filter(|line| line.contains(needle.as_str()))
+            .collect::<Vec<String>>()
+            .join("\n")
+    };
+
+    // Phase 1 of `sync`: every package's database is fetched first, and those items
+    // are named after their package ("alpha db fetch") so they group with it.
+    let done_before: u64 = done_count();
+    set_expected(2);
+    let db_phase: String = {
+        let mut alpha_db: Item = child("alpha db fetch".to_string());
+        alpha_db.init(Some(50), gix::progress::count("files"));
+        alpha_db.set(50);
+        alpha_db.done("Completed in 1.00 seconds".to_string());
+
+        let mut beta_db: Item = child("beta db fetch".to_string());
+        beta_db.init(Some(50), gix::progress::count("files"));
+        beta_db.set(50);
+        beta_db.done("Completed in 1.00 seconds".to_string());
+
+        let out: String = frame_of("db phase done, no package checked out yet".to_string());
+        out
+    };
+
+    // Phase 2 and 3 share one live item, the way a real bar is repainted while its
+    // `Item` is still in scope.
+    let mut alpha: Item = child("alpha".to_string());
+    alpha.init(Some(3), gix::progress::count("actions"));
+    alpha.inc();
+    let fetch: Item = alpha.add_child("fetch".to_string());
+    fetch.init(Some(5000), gix::progress::count("files"));
+    fetch.set(5000);
+
+    let pkg_phase: String =
+        frame_of("package fetch done, worktree stage not discovered yet".to_string());
+
+    let work: Item = alpha.add_child("worktree".to_string());
+    work.init(Some(100), gix::progress::count("files"));
+    work.set(50);
+
+    let work_phase: String = frame_of("worktree stage half written".to_string());
+
+    alpha.done("Checked out in 1.00 seconds".to_string());
+    task_done("alpha".to_string());
+
+    let done_phase: String = frame_of("package finished".to_string());
+
+    renderer.clear();
+
+    let db_overall: String = line_with(db_phase.clone(), "packages".to_string());
+    let pkg_alpha: String = line_with(pkg_phase.clone(), "alpha ━".to_string());
+    let work_alpha: String = line_with(work_phase.clone(), "alpha ━".to_string());
+    let done_alpha: String = line_with(done_phase.clone(), "alpha ━".to_string());
+    let done_overall: String = line_with(done_phase.clone(), "packages".to_string());
+
+    let db_expected: String = format!("{} of 2 packages", done_before);
+    let done_expected: String = format!("{} of 2 packages", done_before + 1);
+
+    anyhow::ensure!(
+        db_overall.contains(db_expected.as_str()),
+        "the overall bar must count packages, not the db items named after them: {db_phase}",
+    );
+
+    anyhow::ensure!(
+        !db_overall.contains("100%"),
+        "the overall bar must not read 100% while no package has been checked out: {db_phase}",
+    );
+
+    anyhow::ensure!(
+        !pkg_alpha.contains("100%"),
+        "a finished fetch must not pin the package bar at 100% while its worktree stage is missing: {pkg_phase}",
+    );
+
+    anyhow::ensure!(
+        !work_alpha.contains("100%"),
+        "a running package bar must never read 100%: {work_phase}",
+    );
+
+    anyhow::ensure!(
+        work_alpha.contains("worktree"),
+        "the running stage must be named so a long step does not look like a bar sitting still: {work_phase}",
+    );
+
+    anyhow::ensure!(
+        work_alpha.contains("67%"),
+        "a track that grew must not pull the fill back: {work_phase}",
+    );
+
+    anyhow::ensure!(
+        done_alpha.contains("100%"),
+        "a finished package bar must read 100%: {done_phase}",
+    );
+
+    anyhow::ensure!(
+        done_overall.contains(done_expected.as_str()),
+        "the overall bar must count the package once it is done: {done_phase}",
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
 fn test_progress_frame() -> anyhow::Result<()> {
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
+
+    let _hold = TEST_LOCK.lock();
 
     let mut zlib: Item = child("zlib".to_string());
     let fetch: Item = zlib.add_child("fetch".to_string());
@@ -612,7 +836,10 @@ fn test_progress_frame() -> anyhow::Result<()> {
     let specs: Vec<BarSpec> = collect_specs();
 
     for index in 0..specs.len() {
-        eprintln!("spec {}: {} {} / {} done={}", index, specs[index].name, specs[index].current, specs[index].total, specs[index].done);
+        eprintln!(
+            "spec {}: {} {} / {} done={}",
+            index, specs[index].name, specs[index].current, specs[index].total, specs[index].done
+        );
     }
 
     anyhow::ensure!(
@@ -624,7 +851,8 @@ fn test_progress_frame() -> anyhow::Result<()> {
     let style: ProgressStyle = bar_style(Term::buffered_stderr(), false);
     let done_style: ProgressStyle = bar_style(Term::buffered_stderr(), true);
     let term: InMemoryTerm = InMemoryTerm::new(24, 200);
-    let target: ProgressDrawTarget = ProgressDrawTarget::term_like_with_hz(Box::new(term.clone()), 20);
+    let target: ProgressDrawTarget =
+        ProgressDrawTarget::term_like_with_hz(Box::new(term.clone()), 20);
 
     let mut renderer: Renderer = Renderer::new(
         MultiProgress::with_draw_target(target),
@@ -638,10 +866,22 @@ fn test_progress_frame() -> anyhow::Result<()> {
     let frame: String = term.contents();
     eprintln!("rendered frame:\n{}", frame);
 
-    anyhow::ensure!(frame.contains("zlib"), "the task name must be drawn as prefix");
-    anyhow::ensure!(frame.contains("curl"), "every top level item must get a bar");
-    anyhow::ensure!(frame.contains("40%"), "nested progress must fold into the parent bar");
-    anyhow::ensure!(frame.contains("openssl"), "unknown-total tasks must still get a line");
+    anyhow::ensure!(
+        frame.contains("zlib"),
+        "the task name must be drawn as prefix"
+    );
+    anyhow::ensure!(
+        frame.contains("curl"),
+        "every top level item must get a bar"
+    );
+    anyhow::ensure!(
+        frame.contains("40%"),
+        "nested progress must fold into the parent bar"
+    );
+    anyhow::ensure!(
+        frame.contains("openssl"),
+        "unknown-total tasks must still get a line"
+    );
     anyhow::ensure!(
         SPINNER.iter().any(|f| frame.contains(*f)),
         "unknown-total tasks must get a spinner",
@@ -651,13 +891,18 @@ fn test_progress_frame() -> anyhow::Result<()> {
         "the overall bar must count against the phase total, not the live task count",
     );
 
-    let overall_lines: usize = frame.split('\n')
+    let overall_lines: usize = frame
+        .split('\n')
         .map(|line| line.to_string())
         .filter(|line| line.find("packages") != None)
         .count();
 
-    anyhow::ensure!(overall_lines == 1, "the overall bar must be drawn exactly once, got {}", overall_lines);
+    anyhow::ensure!(
+        overall_lines == 1,
+        "the overall bar must be drawn exactly once, got {}",
+        overall_lines
+    );
 
     renderer.clear();
-    return Ok(())
+    return Ok(());
 }

@@ -12,14 +12,17 @@
 
 use chrono::Local;
 use crossterm::tty::IsTty;
-use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError, max_level, set_logger, set_max_level, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use log::{
+    Level, LevelFilter, Log, Metadata, Record, SetLoggerError, max_level, set_logger,
+    set_max_level, warn,
+};
 use std::cmp::max;
 use std::env::var;
 use std::io::stderr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use console::{set_colors_enabled_stderr, Term};
 use crate::progress;
+use console::{Term, set_colors_enabled_stderr};
 
 use anyhow::Error;
 
@@ -31,6 +34,13 @@ const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const GREY: &str = "\x1b[90m";
+
+/// The table palette, one entry per column: the header line and every body line use
+/// the same weight for the same column, so no line of the box reads heavier than
+/// another. Only the package column is bold. The status column's body cells bring
+/// their own green/yellow (that colour is a fact about the package), and its header
+/// takes the column's green.
+const COL_STYLES: [&str; 5] = [BOLD, CYAN, GREY, GREY, GREEN];
 
 /// Columns never shrink below this; below that the table is unreadable anyway.
 const MIN_COL_WIDTH: usize = 6;
@@ -81,7 +91,12 @@ impl Log for GipmLogger {
         };
 
         let message: String = format!("{}", record.args());
-        progress::write_line(format!("{}{}{}", prefix, level_tag(record.level()), indent_continuation(&message)));
+        progress::write_line(format!(
+            "{}{}{}",
+            prefix,
+            level_tag(record.level()),
+            indent_continuation(&message)
+        ));
     }
 
     fn flush(&self) {}
@@ -95,7 +110,11 @@ pub fn init(options: InitOptions) {
     STYLED.store(style_enabled(&options), Ordering::Relaxed);
     let results_off: bool = options.quiet
         || match options.log_level {
-            Some(ref spec) => spec.to_lowercase() == "off" || spec.to_lowercase() == "none" || spec.to_lowercase() == "quiet",
+            Some(ref spec) => {
+                spec.to_lowercase() == "off"
+                    || spec.to_lowercase() == "none"
+                    || spec.to_lowercase() == "quiet"
+            }
             None => false,
         };
 
@@ -117,11 +136,13 @@ pub fn init(options: InitOptions) {
 
     if let Some(spec) = explicit
         && parse_level_name(&spec).is_none()
-            && parse_rust_log(&spec).is_none() {
-                warn!(
-                    "unrecognized --log-level '{}', falling back to the flag count", spec
-                );
-            }
+        && parse_rust_log(&spec).is_none()
+    {
+        warn!(
+            "unrecognized --log-level '{}', falling back to the flag count",
+            spec
+        );
+    }
 }
 
 pub fn current_level() -> LevelFilter {
@@ -139,11 +160,13 @@ pub fn resolve_level(options: InitOptions) -> LevelFilter {
         }
     }
 
-    if options.verbosity == 0 && !options.quiet
+    if options.verbosity == 0
+        && !options.quiet
         && let Ok(spec) = var("RUST_LOG")
-            && let Some(filter) = parse_rust_log(&spec) {
-                return filter;
-            }
+        && let Some(filter) = parse_rust_log(&spec)
+    {
+        return filter;
+    }
 
     if options.quiet {
         return LevelFilter::Error;
@@ -296,7 +319,7 @@ pub fn error_text(err: &Error) -> String {
 /// these lines must still show up in a default run. Suppressed by `-q` and `--log-level off`.
 pub fn result(message: String) {
     if !RESULTS.load(Ordering::Relaxed) {
-        return
+        return;
     }
 
     progress::write_line(format!("{}{}", level_tag(Level::Info), message));
@@ -311,14 +334,12 @@ pub fn report_error(err: &Error) {
         "".to_string()
     };
 
-    progress::write_line(
-        format!(
-            "{}{}{}",
-            prefix,
-            level_tag(Level::Error),
-            indent_continuation(&error_text(err)),
-        ),
-    );
+    progress::write_line(format!(
+        "{}{}{}",
+        prefix,
+        level_tag(Level::Error),
+        indent_continuation(&error_text(err)),
+    ));
 }
 
 /// Rough display width of one code point: combining marks are free, East Asian wide
@@ -327,23 +348,21 @@ pub fn report_error(err: &Error) {
 fn glyph_width(ch: char) -> usize {
     let cp: u32 = ch as u32;
 
-    let zero_width: bool =
-        (0x0300..=0x036f).contains(&cp)
-            || (0x200b..=0x200f).contains(&cp)
-            || (0xfe00..=0xfe0f).contains(&cp);
+    let zero_width: bool = (0x0300..=0x036f).contains(&cp)
+        || (0x200b..=0x200f).contains(&cp)
+        || (0xfe00..=0xfe0f).contains(&cp);
 
     if zero_width {
         return 0;
     }
 
-    let wide: bool =
-        (0x1100..=0x115f).contains(&cp)
-            || (0x2e80..=0x32ff).contains(&cp)
-            || (0x3400..=0x9fff).contains(&cp)
-            || (0xac00..=0xd7a0).contains(&cp)
-            || (0xff00..=0xff60).contains(&cp)
-            || (0xffe0..=0xffe6).contains(&cp)
-            || (0x1f000..=0x1f9ff).contains(&cp);
+    let wide: bool = (0x1100..=0x115f).contains(&cp)
+        || (0x2e80..=0x32ff).contains(&cp)
+        || (0x3400..=0x9fff).contains(&cp)
+        || (0xac00..=0xd7a0).contains(&cp)
+        || (0xff00..=0xff60).contains(&cp)
+        || (0xffe0..=0xffe6).contains(&cp)
+        || (0x1f000..=0x1f9ff).contains(&cp);
 
     if wide {
         return 2;
@@ -362,12 +381,12 @@ fn visible_width(text: String) -> usize {
             if ch == 'm' {
                 in_escape = false;
             }
-            continue
+            continue;
         }
 
         if ch == '\x1b' {
             in_escape = true;
-            continue
+            continue;
         }
 
         width += 1;
@@ -400,17 +419,17 @@ fn truncate_visible(text: String, limit: usize) -> String {
                 in_escape = false;
                 open_style = !out.ends_with(RESET)
             }
-            continue
+            continue;
         }
 
         if ch == '\x1b' {
             in_escape = true;
             out.push(ch);
-            continue
+            continue;
         }
 
         if seen >= limit {
-            break
+            break;
         }
 
         out.push(ch);
@@ -418,7 +437,7 @@ fn truncate_visible(text: String, limit: usize) -> String {
     }
 
     if open_style {
-        return format!("{}{}", out, RESET)
+        return format!("{}{}", out, RESET);
     }
 
     out
@@ -428,20 +447,22 @@ fn truncate_visible(text: String, limit: usize) -> String {
 /// is … for styled output and .. for plain output, which must stay pure ASCII.
 fn fit_cell(value: String, width: usize) -> String {
     if visible_width(value.clone()) > width {
-        let ellipsis: &str =
-            if STYLED.load(Ordering::Relaxed) {
-                "…"
-            } else {
-                ".."
-            };
+        let ellipsis: &str = if STYLED.load(Ordering::Relaxed) {
+            "…"
+        } else {
+            ".."
+        };
 
         let marker: usize = visible_width(ellipsis.to_string());
 
         if width > marker {
-            return pad(&truncate_visible(value.clone(), width - marker).clone(), width)
+            return pad(
+                &truncate_visible(value.clone(), width - marker).clone(),
+                width,
+            );
         }
 
-        return "".to_string()
+        return "".to_string();
     }
 
     pad(&value.clone(), width)
@@ -477,7 +498,7 @@ fn fit_widths(widths: Vec<usize>) -> Vec<usize> {
         }
 
         if w[widest] <= MIN_COL_WIDTH {
-            break
+            break;
         }
 
         w[widest] -= 1;
@@ -489,10 +510,10 @@ fn fit_widths(widths: Vec<usize>) -> Vec<usize> {
 
 fn summary_cells(row: &SummaryRow) -> Vec<String> {
     vec![
-        style(BOLD, &row.name.clone()),
-        style(CYAN, &row.version.clone()),
-        style(GREY, &row.tag.clone()),
-        style(GREY, &row.commit.clone()),
+        style(COL_STYLES[0], &row.name.clone()),
+        style(COL_STYLES[1], &row.version.clone()),
+        style(COL_STYLES[2], &row.tag.clone()),
+        style(COL_STYLES[3], &row.commit.clone()),
         row.status.clone(),
     ]
 }
@@ -547,7 +568,13 @@ fn plain_edges() -> TableEdges {
 }
 
 /// One border of the table.
-fn border_line(widths: Vec<usize>, left: String, mid: String, right: String, fill: String) -> String {
+fn border_line(
+    widths: Vec<usize>,
+    left: String,
+    mid: String,
+    right: String,
+    fill: String,
+) -> String {
     let mut parts: Vec<String> = vec![];
 
     for width in widths.iter() {
@@ -557,15 +584,20 @@ fn border_line(widths: Vec<usize>, left: String, mid: String, right: String, fil
     format!("{}{}{}", left, parts.join(mid.as_str()), right)
 }
 
-/// One row of the table.
+/// One row of the table. The vertical rules carry the same dim grey as the horizontal
+/// ones, so the frame is one weight instead of a bright grid over dim rules.
 fn cell_line(cells: Vec<String>, widths: Vec<usize>, vertical: String) -> String {
     let mut parts: Vec<String> = vec![];
 
     for index in 0..cells.len() {
-        parts.push(format!(" {} ", fit_cell(cells[index].clone(), widths[index])));
+        parts.push(format!(
+            " {} ",
+            fit_cell(cells[index].clone(), widths[index])
+        ));
     }
 
-    format!("{}{}{}", vertical, parts.join(vertical.as_str()), vertical.clone())
+    let rule: String = style(GREY, &vertical.clone());
+    format!("{}{}{}", rule, parts.join(rule.as_str()), rule)
 }
 
 /// The result table: stdout only, never level-filtered, column aligned.
@@ -597,8 +629,13 @@ pub fn keep_columns(rows: &[SummaryRow]) -> Vec<bool> {
 }
 
 pub fn format_summary(title: String, rows: Vec<SummaryRow>) -> String {
-    let all_headers: Vec<String> =
-        vec!["package".to_string(), "version".to_string(), "tag".to_string(), "commit".to_string(), "status".to_string()];
+    let all_headers: Vec<String> = vec![
+        "package".to_string(),
+        "version".to_string(),
+        "tag".to_string(),
+        "commit".to_string(),
+        "status".to_string(),
+    ];
 
     // A column that carries no information anywhere is dropped instead of drawn as an
     // empty gutter (sync pins commits, so it has neither a semver nor a tag to show).
@@ -617,10 +654,14 @@ pub fn format_summary(title: String, rows: Vec<SummaryRow>) -> String {
         out
     };
 
+    // Header cells take their column's style rather than a blanket bold, so the weight
+    // scheme is the same on the header line and on every body line.
     let mut headers: Vec<String> = vec![];
+    let mut styled_headers: Vec<String> = vec![];
     for index in 0..all_headers.len() {
         if keep[index] {
             headers.push(all_headers[index].clone());
+            styled_headers.push(style(COL_STYLES[index], &all_headers[index].clone()));
         }
     }
 
@@ -639,62 +680,58 @@ pub fn format_summary(title: String, rows: Vec<SummaryRow>) -> String {
     widths = fit_widths(widths.clone());
 
     // Unicode box drawing only where it is known to render; ASCII everywhere else.
-    let edges: TableEdges =
-        if STYLED.load(Ordering::Relaxed) {
-            styled_edges()
-        } else {
-            plain_edges()
-        };
+    let edges: TableEdges = if STYLED.load(Ordering::Relaxed) {
+        styled_edges()
+    } else {
+        plain_edges()
+    };
 
     let mut lines: Vec<String> = vec![style(BOLD, &title)];
-    lines.push(
-        style(
-            GREY,
-            &border_line(
-                widths.clone(),
-                edges.top_left.clone(),
-                edges.top_mid.clone(),
-                edges.top_right.clone(),
-                edges.fill.clone(),
-            ),
+    lines.push(style(
+        GREY,
+        &border_line(
+            widths.clone(),
+            edges.top_left.clone(),
+            edges.top_mid.clone(),
+            edges.top_right.clone(),
+            edges.fill.clone(),
         ),
-    );
+    ));
 
-    let mut styled_headers: Vec<String> = vec![];
-    for header in headers.iter() {
-        styled_headers.push(style(BOLD, &header.clone()));
-    }
-
-    lines.push(cell_line(styled_headers.clone(), widths.clone(), edges.vertical.clone()));
-    lines.push(
-        style(
-            GREY,
-            &border_line(
-                widths.clone(),
-                edges.mid_left.clone(),
-                edges.mid_mid.clone(),
-                edges.mid_right.clone(),
-                edges.fill.clone(),
-            ),
+    lines.push(cell_line(
+        styled_headers.clone(),
+        widths.clone(),
+        edges.vertical.clone(),
+    ));
+    lines.push(style(
+        GREY,
+        &border_line(
+            widths.clone(),
+            edges.mid_left.clone(),
+            edges.mid_mid.clone(),
+            edges.mid_right.clone(),
+            edges.fill.clone(),
         ),
-    );
+    ));
 
     for row in rows.iter() {
-        lines.push(cell_line(cells_of(row), widths.clone(), edges.vertical.clone()));
+        lines.push(cell_line(
+            cells_of(row),
+            widths.clone(),
+            edges.vertical.clone(),
+        ));
     }
 
-    lines.push(
-        style(
-            GREY,
-            &border_line(
-                widths.clone(),
-                edges.bot_left.clone(),
-                edges.bot_mid.clone(),
-                edges.bot_right.clone(),
-                edges.fill.clone(),
-            ),
+    lines.push(style(
+        GREY,
+        &border_line(
+            widths.clone(),
+            edges.bot_left.clone(),
+            edges.bot_mid.clone(),
+            edges.bot_right.clone(),
+            edges.fill.clone(),
         ),
-    );
+    ));
 
     lines.join("\n")
 }
@@ -829,7 +866,10 @@ fn test_summary_table() -> anyhow::Result<()> {
 
     let first: usize = visible_width(lines[1].to_string());
     anyhow::ensure!(
-        lines.iter().skip(1).all(|line: &&str| visible_width(line.to_string()) == first),
+        lines
+            .iter()
+            .skip(1)
+            .all(|line: &&str| visible_width(line.to_string()) == first),
         "every table line must be the same width: {text}",
     );
 
@@ -891,7 +931,10 @@ fn test_summary_cell_cutting() -> anyhow::Result<()> {
     // inherit the cell's colour.
     // Built explicitly: style() is a no-op when STYLED is off, and the cut has to be
     // exercised on a cell that really carries an escape.
-    let cell: String = format!("{}{}{}", GREY, "046209e561b7e9b5aab1aef7daebf29ee6c1b2f4", RESET);
+    let cell: String = format!(
+        "{}{}{}",
+        GREY, "046209e561b7e9b5aab1aef7daebf29ee6c1b2f4", RESET
+    );
     let cut: String = truncate_visible(cell.clone(), 12);
 
     anyhow::ensure!(
