@@ -22,3 +22,8 @@ target/
 #.idea/
 # pi coding-agent state (local harness settings, not part of the project)
 .agent/
+
+# Test scaffolding: fixture repositories and the isolated database cache
+# built by tests/common (see tests/*/fixtures, tests/*/cache)
+tests/*/fixtures/
+tests/*/cache/

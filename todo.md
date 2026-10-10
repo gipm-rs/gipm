@@ -8,7 +8,9 @@ bugs:
 
 todo:
 
-- tests
+- tests: the four integration targets are now hermetic (fixture repos over `file://`,
+  per-test database cache, lockfile generated in-test). Still open: a fixture carrying a
+  real submodule, and one whose default branch is not `main`.
 
 logging/progress (done, see docs/plans/logging-overhaul.md):
 
