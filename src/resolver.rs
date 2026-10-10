@@ -119,11 +119,15 @@ impl DependencyCache {
                         .map(|(dep, _)| (normalize_url(&dep.url), dep.clone()))
                         .collect();
 
-                    // Constraints are handled post update
-                    for (dep, vers) in &deps_vec {
-                        let dep = updated_deps.get(&normalize_url(&dep.url)).unwrap_or(dep);
-                        constraints.insert(dep.clone(), vers.clone());
-                    }
+                    // Constraints are handled post update. pubgrub 0.4 dropped the
+                    // mutating `insert` in favour of a FromIterator instance.
+                    constraints = deps_vec
+                        .iter()
+                        .map(|(dep, vers)| {
+                            let dep = updated_deps.get(&normalize_url(&dep.url)).unwrap_or(dep);
+                            (dep.clone(), vers.clone())
+                        })
+                        .collect();
                 }
                 Err(e) => {
                     warn!(

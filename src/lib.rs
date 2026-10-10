@@ -168,14 +168,20 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     );
 
     // Resolve all dependencies
-    let mut resolved_dependencies =
+    let resolved_dependencies =
         resolve(&resolver, root_dep.clone(), dummy_root_version)
             .context(
                 "No version selection satisfies the ranges in dependencies.yaml (the solver's reasoning is logged at -v)",
             )?;
 
-    // Remove the root dependency, as it is not an item to be checked out.
-    resolved_dependencies.remove(&root_dep);
+    // pubgrub 0.4 hands back an opaque SelectedDependencies view (iter/get only),
+    // so materialise it here: the root entry is dropped, and a Vec gives the
+    // deterministic ordering the table, the lockfile and the tests all rely on.
+    let resolved_dependencies: Vec<(GitPackage, Version)> = resolved_dependencies
+        .iter()
+        .filter(|(dep, _)| dep.url != git::PackageUrl::Root)
+        .map(|(dep, version)| (dep.clone(), version.clone()))
+        .collect();
 
     // Now that the graph is solved, the overall bar has an honest denominator.
     progress::set_expected(resolved_dependencies.len());

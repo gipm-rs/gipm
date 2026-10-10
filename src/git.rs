@@ -17,9 +17,8 @@ use std::fmt;
 use std::fmt::Display;
 use std::fs::{create_dir_all, metadata, remove_dir_all, remove_file, set_permissions};
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,7 +493,7 @@ impl GitPackage {
 
             // First make the directory
             create_dir_all(&path).expect("Failed to create database clone directory");
-            let url = gix::url::parse(self.url.as_str().into()).expect("Failed to parse URL");
+            let url = gix::url::parse(self.url.as_str()).expect("Failed to parse URL");
 
             let start = Instant::now();
 
@@ -546,7 +545,7 @@ impl GitPackage {
         let mut config = checkout_repo.config_snapshot_mut();
         config
             .set_raw_value(
-                &"remote.origin.url",
+                "remote.origin.url",
                 bare_db_path.to_str().unwrap().as_bytes(),
             )
             .expect("Failed to set remote URL");
@@ -619,7 +618,7 @@ impl GitPackage {
         let mut config = checkout_repo.config_snapshot_mut();
         config
             .set_raw_value(
-                &"remote.origin.url",
+                "remote.origin.url",
                 bare_db_path.to_str().unwrap().as_bytes(),
             )
             .expect("Failed to set remote URL");
@@ -699,11 +698,25 @@ impl GitPackage {
         object: impl Into<ObjectId>,
         sub_progress: &mut Item,
     ) -> anyhow::Result<()> {
+        self.clone_object_into(&self.get_checkout_path()?, object, sub_progress)
+    }
+
+    /// Clone `object` out of the package database into an explicit destination
+    /// directory rather than the package's `.gitvenv` entry. A submodule is a
+    /// package that lives somewhere other than `.gitvenv/<name>` -- its mount
+    /// point comes from the parent's index -- so this is the only place the
+    /// destination is not implied by the package itself.
+    pub fn clone_object_into(
+        &self,
+        dest: &PathBuf,
+        object: impl Into<ObjectId>,
+        sub_progress: &mut Item,
+    ) -> anyhow::Result<()> {
         // Check if the repository already exists, which it shouldn't if we're cloning
-        let checkout_dir = self.get_checkout_path()?;
+        let checkout_dir = dest;
         let bare_db_path = self.get_database_path()?;
         let object: ObjectId = object.into();
-        if gix::open(&checkout_dir).is_ok() {
+        if gix::open(checkout_dir).is_ok() {
             anyhow::bail!(
                 "Repository already exists at {} - should call checkout, not clone",
                 self.get_checkout_path()?.display()
@@ -711,7 +724,7 @@ impl GitPackage {
         }
 
         if !&checkout_dir.exists() {
-            create_dir_all(&checkout_dir).context(format!(
+            create_dir_all(checkout_dir).context(format!(
                 "Failed to create checkout directory: {checkout_dir:?}"
             ))?;
         }
@@ -735,7 +748,7 @@ impl GitPackage {
         // Alternatively we could search the db for a ref that matches the object id, which we expect there should be most of the time
         let mut prepare_clone = gix::prepare_clone(
             bare_db_path.to_str().expect("Failed to get bare db path"),
-            &checkout_dir,
+            checkout_dir,
         )
         .expect("Failed to prepare clone")
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
@@ -771,7 +784,7 @@ impl GitPackage {
 
         sub_progress_checkout_overall.inc();
 
-        let (repo, _outcome) = prepare
+        let (_repo, _outcome) = prepare
             .main_worktree(
                 &mut sub_progress_checkout_overall,
                 &gix::interrupt::IS_INTERRUPTED,
@@ -783,32 +796,13 @@ impl GitPackage {
 
         sub_progress_checkout_overall.inc();
 
-        let subs = repo.submodules()?;
-        let names: Vec<String> = match subs {
-            None => vec![],
-            Some(list) => list
-                .map(|s| format!("{}", s.name()))
-                .collect::<Vec<String>>(),
-        };
-
-        if !names.is_empty() {
-            sub_progress_checkout_overall.info(format!(
-                "Warning: submodule support is not yet fully implemented Submodules \
-                will be updated using the `git` cli. Detected submodules in {}:",
-                self.name()
-            ));
-            for name in names.iter() {
-                sub_progress_checkout_overall.info(format!("  - {}", name.clone()));
-            }
-
-            update_submodules(
-                checkout_dir.to_str().expect("path should resolve a str"),
-                self.name(),
-                names.clone(),
-                Some(&mut sub_progress_checkout_overall),
-            )
-            .context("submodule update failed")?;
-        };
+        update_submodules(
+            checkout_dir,
+            self.name(),
+            &self.url,
+            Some(&mut sub_progress_checkout_overall),
+        )
+        .context("submodule update failed")?;
 
         let stop = Instant::now();
 
@@ -835,7 +829,7 @@ impl GitPackage {
         // This facilitates the use of the database as a normal git repository if desired
         let mut f = gix::config::File::from_git_dir(checkout_dir.join(".git").clone())
             .context("Failed to open config file")?;
-        f.set_existing_raw_value(&"remote.origin.url", self.url.as_bytes())
+        f.set_existing_raw_value("remote.origin.url", self.url.as_bytes())
             .context("Failed to write remote.origin.url")?;
         let mut file = std::fs::File::create(checkout_dir.join(".git").join("config"))
             .context("Failed to create config file")?;
@@ -852,21 +846,22 @@ impl GitPackage {
     ) -> anyhow::Result<()> {
         let checkout_repo = gix::open(self.get_checkout_path()?)?;
         let object = object.into();
-        let commit = match checkout_repo.find_object(object) {
-            Ok(object) => object.peel_to_commit()?,
-            Err(e) => match e {
-                gix::object::find::existing::Error::NotFound { oid: _ } => {
-                    // Fetch the object first
-                    self.fetch_ref_from_db(object, sub_progress)?;
-                    checkout_repo.find_object(object)?.peel_to_commit()?
+        // `try_find_object` rather than `find_object` and a match on the error: the
+        // error enum that carried `NotFound` was folded into a composed error type
+        // upstream, so the absence of an object is only an option here.
+        let commit = match checkout_repo.try_find_object(object)? {
+            Some(object) => object.peel_to_commit()?,
+            None => {
+                // Fetch the object first
+                self.fetch_ref_from_db(object, sub_progress)?;
+                match checkout_repo.try_find_object(object)? {
+                    Some(object) => object.peel_to_commit()?,
+                    None => anyhow::bail!(
+                        "Object {object} is still missing from repository {} after fetching from the database",
+                        self.name(),
+                    ),
                 }
-                _ => {
-                    anyhow::bail!(
-                        "Failed to find object {object} in repository {}: {e}",
-                        self.name()
-                    );
-                }
-            },
+            }
         };
 
         let mut sub_progress_checkout =
@@ -886,15 +881,6 @@ impl GitPackage {
             };
 
             if !names.is_empty() {
-                sub_progress_checkout.info(format!(
-                    "Warning: submodule support is not yet fully implemented Submodules \
-                    will be updated using the `git` cli. Detected submodules in {}:",
-                    self.name()
-                ));
-                for name in names.iter() {
-                    sub_progress_checkout.info(format!("  - {}", name.clone()));
-                }
-
                 sub_progress_checkout.info("updating submodules".to_string());
 
                 // Update the HEAD reference to point to the correct tag ref
@@ -914,11 +900,9 @@ impl GitPackage {
                 update_submodules(
                     checkout_repo
                         .workdir()
-                        .expect("should have a workdir")
-                        .to_str()
-                        .expect("path should resolve a str"),
+                        .expect("should have a workdir"),
                     self.name(),
-                    names.clone(),
+                    &self.url,
                     Some(&mut sub_progress_checkout),
                 )
                 .context("submodule update failed")?;
@@ -948,12 +932,10 @@ impl GitPackage {
             gix::index::State::from_tree(&tree.id, &checkout_repo.objects, Default::default())?;
         let mut index = gix::index::File::from_state(state, checkout_repo.index_path());
 
-        // Set checkout options to handle untracked files properly
-        let opts = Options {
-            destination_is_initially_empty: false, // We're updating existing worktree
-            overwrite_existing: false,             // Force overwrite existing files
-            ..Default::default()
-        };
+        // Options now carry the repository's filter pipeline, so they are built rather
+        // than written out; both flags below were left at their default false.
+        let (pipeline, _pipeline_index) = checkout_repo.filter_pipeline(None)?;
+        let opts = Options::new(pipeline.into_parts().0);
 
         let files = sub_progress_checkout.add_child_with_id(
             "checkout commit".to_string(),
@@ -1150,11 +1132,6 @@ impl GitPackage {
             deref: false,
         })?;
 
-        let update_submodules_info_item = sub_progress.add_child_with_id(
-            "Update submodules".to_string(),
-            gix::clone::checkout::main_worktree::ProgressId::CheckoutFiles.into(),
-        );
-
         // Update submodules if any
         let subs = checkout_repo.submodules()?;
         let names: Vec<String> = match subs {
@@ -1165,23 +1142,12 @@ impl GitPackage {
         };
 
         if !names.is_empty() {
-            update_submodules_info_item.info(format!(
-                "Warning: submodule support is not yet fully implemented. Submodules \
-                will be updated using the `git` cli in {}:",
-                self.name(),
-            ));
-            for name in names.iter() {
-                update_submodules_info_item.info(format!("  - {}", name.clone()));
-            }
-
             update_submodules(
                 checkout_repo
                     .workdir()
-                    .expect("should have a workdir")
-                    .to_str()
-                    .expect("path should resolve a str"),
+                    .expect("should have a workdir"),
                 self.name(),
-                names.clone(),
+                &self.url,
                 Some(sub_progress),
             )
             .context("submodule update failed")?;
@@ -1418,7 +1384,7 @@ impl GitPackage {
         // This facilitates the use of the database as a normal git repository if desired
         let mut f = gix::config::File::from_git_dir(checkout_dir.join(".git").clone())
             .context("Failed to open config file")?;
-        f.set_existing_raw_value(&"remote.origin.url", self.url.as_bytes())
+        f.set_existing_raw_value("remote.origin.url", self.url.as_bytes())
             .context("Failed to write remote.origin.url")?;
         let mut file = std::fs::File::create(checkout_dir.join(".git").join("config"))
             .context("Failed to create config file")?;
@@ -1535,175 +1501,114 @@ pub fn normalize_url(url: &PackageUrl) -> String {
     }
 }
 
-/// Count the `From ` lines (one per fetched submodule repository) in a read chunk,
-/// carrying the trailing partial line over to the next chunk. Counting per chunk without
-/// the carry-over would miss or double-count every line that straddles a read boundary.
-pub fn count_fetch_lines(pending: &str, chunk: &[u8]) -> (usize, String) {
-    let text: String = format!("{}{}", pending, String::from_utf8_lossy(chunk));
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|line| line.to_string())
-        .collect::<Vec<String>>();
-    let tail: String = lines[lines.len() - 1].to_string();
 
-    let mut hits: usize = 0;
-    for line in lines.iter().take(lines.len() - 1) {
-        if line.contains("From ") {
-            hits += 1;
-        }
+/// Update the submodules of the repository checked out at `work_dir`, in-process.
+///
+/// A submodule is a package like any other: the commit it is pinned to is an
+/// entry in the parent's index, its remote comes from `.gitmodules`, and it is
+/// cloned out of the shared database through the same path a top-level
+/// dependency takes. Recursion is therefore not done here -- `clone_object_into`
+/// ends by calling this function, so the clone that owns a submodule brings in
+/// that submodule's own submodules.
+pub fn update_submodules(
+    work_dir: &Path,
+    pkg_name: String,
+    parent_url: &PackageUrl,
+    parent: Option<&mut Item>,
+) -> anyhow::Result<usize> {
+    let repo = gix::open(work_dir)?;
+
+    let subs: Vec<gix::Submodule<'_>> = match repo.submodules()? {
+        None => Vec::new(),
+        Some(list) => list.collect(),
+    };
+
+    if subs.is_empty() {
+        return Ok(0);
     }
 
-    (hits, tail)
-}
-
-fn update_submodules(
-    git_dir: &str,
-    name: String,
-    submodules: Vec<String>,
-    parent: Option<&mut Item>,
-) -> anyhow::Result<()> {
     // Nested under the package bar when one is available, its own line otherwise: a
     // submodule download must never be a silent stretch of the run. The parameter is not
     // called `progress` so the `progress::child` fallback below can stay readable.
-    let subprogress: Item = match parent {
+    let mut subprogress: Item = match parent {
         Some(item) => item.add_child("submodules".to_string()),
-        None => progress::child(format!("{} submodules", name)),
+        None => progress::child(format!("{} submodules", pkg_name)),
     };
 
-    subprogress.init(Some(submodules.len()), gix::progress::count("submodules"));
+    subprogress.init(Some(subs.len()), gix::progress::count("submodules"));
 
-    let mut proc = Command::new("git")
-        .arg("submodule")
-        .arg("update")
-        .arg("--init")
-        .arg("--recursive")
-        .arg("--depth")
-        .arg("1")
-        .args([
-            "--jobs",
-            &std::thread::available_parallelism()
-                .unwrap()
-                .get()
-                .to_string(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .current_dir(git_dir)
-        .spawn()
-        .context("Failed to run git submodule update")?;
+    let mut updated: usize = 0;
+    for sub in subs.iter() {
+        let name: String = format!("{}", sub.name());
 
-    // The pipes are taken out of the process up front so both can be drained before
-    // waiting for the exit code.
-    let err_pipe = proc.stderr;
-    let out_pipe = proc.stdout;
-    proc.stderr = None;
-    proc.stdout = None;
+        // The pinned commit is an index entry, so it is known before anything is
+        // downloaded; a submodule that carries no index entry has nothing to check
+        // out and is left alone rather than guessed at.
+        let pinned: ObjectId = match sub.index_id()? {
+            None => {
+                subprogress.info(format!(
+                    "{} has no commit pinned in the parent index, leaving it alone",
+                    name,
+                ));
+                continue;
+            }
+            Some(oid) => oid,
+        };
 
-    let mut err_bytes: Vec<u8> = Vec::new();
-    let mut out_bytes: Vec<u8> = Vec::new();
-    let mut fetched: usize = 0;
-    let mut pending_err: String = "".to_string();
+        let url: String = resolve_submodule_url(
+            format!("{}", sub.url()?),
+            parent_url,
+            work_dir,
+        );
+        let dest: PathBuf = sub.work_dir()?;
 
-    // Both pipes are drained alternately. Reading one of them to EOF first would let the
-    // child fill the other pipe's buffer, block there, and leave `wait()` hanging behind
-    // it on a run that produces a lot of stdout.
-    let mut err_stream: Option<std::process::ChildStderr> = err_pipe;
-    let mut out_stream: Option<std::process::ChildStdout> = out_pipe;
-    let mut err_eof: bool = false;
-    let mut out_eof: bool = false;
-    let mut err_chunk: Vec<u8> = vec![0u8; 4096];
-    let mut out_chunk: Vec<u8> = vec![0u8; 4096];
+        let dep = GitPackage::new(PackageUrl::GitUrl(url), Some(name.clone()), None);
 
-    while !(err_eof && out_eof) {
-        if !err_eof {
-            let pipe: Option<std::process::ChildStderr> = err_stream;
-            err_stream = None;
-
-            if let Some(mut handle) = pipe {
-                match handle.read(&mut err_chunk) {
-                    Ok(0) => err_eof = true,
-                    Ok(count) => {
-                        err_chunk.truncate(count);
-                        err_bytes.extend(err_chunk.iter());
-
-                        let (hits, tail): (usize, String) =
-                            count_fetch_lines(&pending_err, &err_chunk);
-                        pending_err = tail;
-                        fetched += hits;
-
-                        subprogress.set(if fetched > submodules.len() {
-                            submodules.len()
-                        } else {
-                            fetched
-                        });
-                    }
-                    Err(_) => err_eof = true,
-                }
-
-                err_stream = Some(handle);
-            } else {
-                err_eof = true;
+        let mut item = subprogress.add_child(format!("{} clone", name));
+        match dep.ensure_usable_database()
+            .and_then(|_| dep.clone_object_into(&dest, pinned, &mut item))
+        {
+            Ok(_) => {
+                item.done(format!("{} submodule at {}", name, pinned));
+                updated += 1;
+            }
+            Err(e) => {
+                item.fail(format!("Failed to update submodule {}: {e}", name));
+                subprogress.fail(format!("Failed to update submodules: {e}"));
+                drop(subprogress);
+                return Err(e);
             }
         }
 
-        if !out_eof {
-            let pipe: Option<std::process::ChildStdout> = out_stream;
-            out_stream = None;
-
-            if let Some(mut handle) = pipe {
-                match handle.read(&mut out_chunk) {
-                    Ok(0) => out_eof = true,
-                    Ok(count) => {
-                        out_chunk.truncate(count);
-                        out_bytes.extend(out_chunk.iter());
-                    }
-                    Err(_) => out_eof = true,
-                }
-
-                out_stream = Some(handle);
-            } else {
-                out_eof = true;
-            }
-        }
+        drop(item);
+        subprogress.inc();
     }
 
-    // A final line without a trailing newline still counts as a fetch.
-    if pending_err.contains("From ") {
-        fetched += 1;
-    }
-
-    let status = proc
-        .wait()
-        .context("Failed to wait for git submodule update")?;
-
-    let stderr_text: String = String::from_utf8_lossy(&err_bytes).trim().to_string();
-    let stdout_text: String = String::from_utf8_lossy(&out_bytes).trim().to_string();
-
-    if status.success() {
-        subprogress.done(format!(
-            "{} submodules fetched ({} requested)",
-            fetched,
-            submodules.len()
-        ));
-
-        if !stderr_text.is_empty() {
-            debug!("git submodule update: {stderr_text}");
-        }
-
-        if !stdout_text.is_empty() {
-            debug!("git submodule update (stdout): {stdout_text}");
-        }
-
-        drop(subprogress);
-        return Ok(());
-    }
-
-    // The bar message is only drawn when bars are alive, so the reason has to be in the
-    // log as well or a piped run shows nothing but the final anyhow error.
-    warn!("git submodule update failed for {}: {stderr_text}", name);
-
-    subprogress.fail(format!("Failed to update submodules: {stderr_text}"));
+    subprogress.done(format!("{} submodules updated", updated));
     drop(subprogress);
 
-    anyhow::bail!("Failed to update submodules: {stderr_text}");
+    Ok(updated)
+}
+
+/// Resolve a submodule url the way `git` does: a url that carries no scheme is
+/// relative to the parent's *remote*, not to its checkout directory, and only
+/// the last path segment of that remote is dropped. A parent that is itself a
+/// local path has no remote to lean on, so the checkout directory is used.
+fn resolve_submodule_url(raw: String, parent_url: &PackageUrl, work_dir: &Path) -> String {
+    let has_scheme: bool = raw.contains("://") || (raw.contains('@') && raw.contains(':'));
+    if has_scheme {
+        return raw;
+    }
+
+    let parent: String = parent_url.as_str().to_string();
+    let base: String = match parent.rfind('/') {
+        Some(idx) => parent[..idx].to_string(),
+        None => "".to_string(),
+    };
+
+    if parent.contains("://") && !base.is_empty() {
+        return format!("{}/{}", base, raw);
+    }
+
+    work_dir.join(raw).display().to_string()
 }

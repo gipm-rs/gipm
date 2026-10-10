@@ -55,8 +55,10 @@ Test caveats — the suite is hermetic, but it still shells out:
 | `.gitvenv/` | Generated checkout directory (gitignored); never hand-edit it. |
 
 Git work is driven entirely by [`gix`](https://github.com/GitoxideLabs/gitoxide) in-process —
-there is no shelled-out `git` except for recursive submodule init, which still falls back to the
-`git` binary because `gix` submodule support is incomplete.
+there is no shelled-out `git` anywhere, including submodule init. Submodules are read from the
+parent's index (`Repository::submodules()`), and each one is cloned through the same object-clone
+path as its parent (`clone_object_into`), which is what makes the recursion natural and keeps a
+submodule's progress inside gix's tree rather than scraped from a child process.
 
 ## Invariants
 
@@ -125,10 +127,11 @@ Always re-resolve and verify, don't eyeball:
 
 - **Submodules**: nested submodules are the pain point this tool replaces; if a dependency carries
   its own dependencies they can appear in both `.gitvenv` and as submodules, which is currently
-  unavoidable.
+  unavoidable. The gix path is written but unexercised — no fixture carries a submodule, so treat
+  "it compiles" as the only evidence until one does.
 - **Scope**: `gipm` is general-purpose and must not shadow a real package manager inside a supported
   ecosystem.
 - **Versioning**: relies on cargo-style [version requirement syntax](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#version-requirement-syntax) and on upstream repos keeping consistent tag formats.
-- `todo.md` tracks open bugs (weak prefix finder, exact-version `1.2.13` matching `>=`, submodule
-  clone permissions, sync-then-update pulling extra tag refs). Read it before working on those areas,
-  and don't silently change behaviour that a bug entry describes as intended-but-rough.
+- `todo.md` tracks open bugs (weak prefix finder, exact-version `1.2.13` matching `>=`, the
+  submodule-clone entry, sync-then-update pulling extra tag refs). Read it before working on those
+  areas, and don't silently change behaviour that a bug entry describes as intended-but-rough.
