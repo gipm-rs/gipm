@@ -2,9 +2,9 @@
 
 pub mod dependency;
 pub mod git;
+pub mod lockfile;
 pub mod logging;
 pub mod progress;
-pub mod lockfile;
 pub mod resolver;
 use crate::git::GitPackage;
 use crate::git::PackageUrl;
@@ -104,20 +104,20 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
                     logging::sym_ok()
                 };
 
-                rows.push(
-                    logging::SummaryRow {
-                        name: dep.name(),
-                        version: "".to_string(),
-                        tag: "".to_string(),
-                        commit: version.to_string(),
-                        status,
-                    }
-                );
+                rows.push(logging::SummaryRow {
+                    name: dep.name(),
+                    version: "".to_string(),
+                    tag: "".to_string(),
+                    commit: version.to_string(),
+                    status,
+                });
             }
             Err(e) => {
                 error!(
                     "Failed to check out {} at commit {}: {}",
-                    name, version, logging::error_text(&e)
+                    name,
+                    version,
+                    logging::error_text(&e)
                 );
                 sync_success = false;
             }
@@ -131,7 +131,9 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    Err(anyhow::anyhow!("Some dependencies failed to sync; see the log above for details."))
+    Err(anyhow::anyhow!(
+        "Some dependencies failed to sync; see the log above for details."
+    ))
 }
 
 // Clean up any resolved dependencies. This only affects. gitvenv, not the gipm.lock file.
@@ -208,17 +210,17 @@ pub fn install_dependencies() -> anyhow::Result<()> {
                 logging::sym_ok()
             };
 
-            let commit: String = dep.get_commit_hash_for_version(version).unwrap_or("".to_string());
+            let commit: String = dep
+                .get_commit_hash_for_version(version)
+                .unwrap_or("".to_string());
 
-            rows.push(
-                logging::SummaryRow {
-                    name: dep.name(),
-                    version: version.to_string(),
-                    tag: dep.get_tag_name(version).unwrap_or("invalid".to_string()),
-                    commit: commit.clone(),
-                    status,
-                }
-            );
+            rows.push(logging::SummaryRow {
+                name: dep.name(),
+                version: version.to_string(),
+                tag: dep.get_tag_name(version).unwrap_or("invalid".to_string()),
+                commit: commit.clone(),
+                status,
+            });
         }
     }
 
@@ -228,9 +230,10 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     // what did resolve, the same way `sync` does.
     for (result, (dep, ver)) in zip(&result, &resolved_dependencies) {
         if let Err(e) = result {
-            return Err(
-                anyhow::anyhow!("Error checking out - {} version {ver}: {e}", dep.name()),
-            )
+            return Err(anyhow::anyhow!(
+                "Error checking out - {} version {ver}: {e}",
+                dep.name()
+            ));
         }
     }
 

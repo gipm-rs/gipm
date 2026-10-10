@@ -66,22 +66,19 @@ pub fn main() -> anyhow::Result<()> {
 
     progress::set_enabled(!parsed_args.no_progress && !parsed_args.quiet && !parsed_args.plain);
 
-    logging::init(
-        logging::InitOptions {
-            verbosity: parsed_args.verbose,
-            quiet: parsed_args.quiet,
-            color: chosen_color(parsed_args.color),
-            plain: parsed_args.plain,
-            log_level: parsed_args.log_level,
-        }
-    );
+    logging::init(logging::InitOptions {
+        verbosity: parsed_args.verbose,
+        quiet: parsed_args.quiet,
+        color: chosen_color(parsed_args.color),
+        plain: parsed_args.plain,
+        log_level: parsed_args.log_level,
+    });
 
-    let outcome: anyhow::Result<()> =
-        match cmd {
-            Command::Update => install_dependencies(),
-            Command::Sync => sync_dependencies(),
-            Command::Clean => clean(),
-        };
+    let outcome: anyhow::Result<()> = match cmd {
+        Command::Update => install_dependencies(),
+        Command::Sync => sync_dependencies(),
+        Command::Clean => clean(),
+    };
 
     if let Err(e) = &outcome {
         // Report the failure through the logging backend (level-tagged, bar-safe) and

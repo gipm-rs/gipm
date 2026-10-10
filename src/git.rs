@@ -204,7 +204,7 @@ impl GitPackage {
     pub fn get_tag_name(&self, version: &Version) -> Option<String> {
         match self.get_available_versions() {
             Ok(v) => v.get(version).cloned(),
-            Err(_) => None
+            Err(_) => None,
         }
     }
 
@@ -898,9 +898,7 @@ impl GitPackage {
                 })?;
 
                 update_submodules(
-                    checkout_repo
-                        .workdir()
-                        .expect("should have a workdir"),
+                    checkout_repo.workdir().expect("should have a workdir"),
                     self.name(),
                     &self.url,
                     Some(&mut sub_progress_checkout),
@@ -1143,9 +1141,7 @@ impl GitPackage {
 
         if !names.is_empty() {
             update_submodules(
-                checkout_repo
-                    .workdir()
-                    .expect("should have a workdir"),
+                checkout_repo.workdir().expect("should have a workdir"),
                 self.name(),
                 &self.url,
                 Some(sub_progress),
@@ -1501,7 +1497,6 @@ pub fn normalize_url(url: &PackageUrl) -> String {
     }
 }
 
-
 /// Update the submodules of the repository checked out at `work_dir`, in-process.
 ///
 /// A submodule is a package like any other: the commit it is pinned to is an
@@ -1555,17 +1550,14 @@ pub fn update_submodules(
             Some(oid) => oid,
         };
 
-        let url: String = resolve_submodule_url(
-            format!("{}", sub.url()?),
-            parent_url,
-            work_dir,
-        );
+        let url: String = resolve_submodule_url(format!("{}", sub.url()?), parent_url, work_dir);
         let dest: PathBuf = sub.work_dir()?;
 
         let dep = GitPackage::new(PackageUrl::GitUrl(url), Some(name.clone()), None);
 
         let mut item = subprogress.add_child(format!("{} clone", name));
-        match dep.ensure_usable_database()
+        match dep
+            .ensure_usable_database()
             .and_then(|_| dep.clone_object_into(&dest, pinned, &mut item))
         {
             Ok(_) => {

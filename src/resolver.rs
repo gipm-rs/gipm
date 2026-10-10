@@ -1,7 +1,7 @@
 use crate::dependency::{
     dependency_spec_to_package_and_version_range, parse_dependencies_yaml_file,
 };
-use crate::git::{normalize_url, GitPackage, PackageUrl};
+use crate::git::{GitPackage, PackageUrl, normalize_url};
 use crate::logging;
 use anyhow::Result;
 use log::{trace, warn};
@@ -68,7 +68,8 @@ impl DependencyCache {
                     // user only ever sees "There is no solution".
                     warn!(
                         "Unable to get dependencies for {} version {version}. This version cannot be chosen: {}",
-                        package.name(), logging::error_text(&e),
+                        package.name(),
+                        logging::error_text(&e),
                     );
                     return Ok(Dependencies::Unavailable(e.to_string()));
                 }
@@ -82,7 +83,12 @@ impl DependencyCache {
                     // Filter for dependencies that haven't had their DB updated yet.
                     // Fix #3: Use normalized URL as the key to handle different url formats (ssh vs https)
                     // ensuring effective deduplication.
-                    let mut deps_to_update: Vec<(GitPackage, VS)> = deps_vec.iter().filter(|&(dep, _)| !self.dbs_updated.contains_key(&normalize_url(&dep.url))).cloned()
+                    let mut deps_to_update: Vec<(GitPackage, VS)> = deps_vec
+                        .iter()
+                        .filter(|&(dep, _)| {
+                            !self.dbs_updated.contains_key(&normalize_url(&dep.url))
+                        })
+                        .cloned()
                         .collect();
 
                     // Update databases in parallel.
@@ -98,13 +104,12 @@ impl DependencyCache {
                         // Update the map of updated dbs using normalized keys for future lookups.
                         for ((dep, _), result) in deps_to_update.iter().zip(update_results.iter()) {
                             if let Err(e) = result {
-                                let msg = format!(
-                                    "Failed to update database for {}: {e}",
-                                    dep.name(),
-                                );
+                                let msg =
+                                    format!("Failed to update database for {}: {e}", dep.name(),);
                                 warn!(
                                     "Unable to update dependency database for {}: {}. This version cannot be chosen",
-                                    dep.name(), logging::error_text(e),
+                                    dep.name(),
+                                    logging::error_text(e),
                                 );
                                 return Ok(Dependencies::Unavailable(msg));
                             }
@@ -132,7 +137,8 @@ impl DependencyCache {
                 Err(e) => {
                     warn!(
                         "Unable to resolve version range for package {} version {version}. This version cannot be chosen: {}",
-                        package.name(), logging::error_text(&e),
+                        package.name(),
+                        logging::error_text(&e),
                     );
                     return Ok(Dependencies::Unavailable(e.to_string()));
                 }
@@ -188,7 +194,10 @@ impl DependencyProvider for GitDependencyProvider {
             // The root package is a special case; it has no versions to choose from
             return Ok(Some(Version::new(0, 0, 0)));
         }
-        trace!("Choosing version for package: {}, range: {range}", package.name());
+        trace!(
+            "Choosing version for package: {}, range: {range}",
+            package.name()
+        );
 
         let version = match self
             .cache
@@ -200,7 +209,12 @@ impl DependencyProvider for GitDependencyProvider {
             Some(version) => Some(version),
             None => package
                 .get_available_versions()
-                .unwrap_or_else(|e| panic!("Should be able to get versions for package {}: {e}", package.name()))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Should be able to get versions for package {}: {e}",
+                        package.name()
+                    )
+                })
                 .keys()
                 .filter(|v| range.contains(v))
                 .max()

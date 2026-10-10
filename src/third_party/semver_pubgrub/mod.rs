@@ -5,7 +5,6 @@ use std::{
     ops::Bound,
 };
 
-
 use pubgrub::{Range, VersionSet};
 use semver::{BuildMetadata, Comparator, Op, Prerelease, Version, VersionReq};
 
@@ -592,7 +591,8 @@ mod test {
                     let ver = semver::Version::parse(raw_ver).unwrap();
                     let mat = req.matches(&ver);
                     if mat != pver.contains(&ver) {
-                        log::trace!("Mismatch: version {}, requirement {}", ver, req); dbg!(&pver);
+                        log::trace!("Mismatch: version {}, requirement {}", ver, req);
+                        dbg!(&pver);
                         assert_eq!(mat, pver.contains(&ver));
                     }
 
@@ -632,7 +632,8 @@ mod test {
                     let ver = semver::Version::parse(raw_ver).unwrap();
                     let mat = req.matches(&ver);
                     if mat != pver.contains(&ver) {
-                        log::trace!("Mismatch: version {}, requirement {}", ver, req); dbg!(&pver);
+                        log::trace!("Mismatch: version {}, requirement {}", ver, req);
+                        dbg!(&pver);
                         assert_eq!(mat, pver.contains(&ver));
                     }
 
@@ -683,7 +684,8 @@ mod test {
                     .filter_map(|ver| {
                         let mat = req.matches(&ver);
                         if mat != pver.contains(&ver) {
-                            log::trace!("Mismatch: version {}, requirement {}", ver, req); dbg!(&pver);
+                            log::trace!("Mismatch: version {}, requirement {}", ver, req);
+                            dbg!(&pver);
                             assert_eq!(mat, pver.contains(&ver));
                         }
                         let cap: SemverCompatibility = ver.into();
