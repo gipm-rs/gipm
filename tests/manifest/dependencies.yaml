@@ -1,0 +1,36 @@
+# A checked-in manifest -- unlike the ones `tests/common` generates, this file
+# is committed and read verbatim by `tests/manifest/test_manifest.rs`, so the
+# shape of a real `dependencies.yaml` lives in the repository rather than being
+# assembled at runtime by a test.
+#
+# The urls are relative to the directory the manifest is read from, which is
+# what keeps the file portable: gipm resolves a bare path against the working
+# directory, so the same file works from a checkout on any machine. The
+# repositories it names are built alongside it by the test.
+#
+# The configuration mirrors what a C/C++ project actually carries: tags that
+# need a prefix stripped, tags whose `_` separators have to be rewritten to
+# dots, a package that brings its own dependencies along in its own
+# dependencies.yaml, and a plain leaf with bare semver tags.
+dependencies:
+  # curl-style tags: curl-7_80_0 names version 7.80.0. The prefix is stripped
+  # before the version is read, and `_` is rewritten to `.` afterwards.
+  - url: ./fixtures/curl.git
+    version: ">=7.80"
+    prefix: curl-
+    replacement:
+      - ["_", "."]
+
+  # zlib-style tags carry a `v` prefix and need no rewriting.
+  - url: ./fixtures/zlib.git
+    version: "^1.2"
+    prefix: v
+
+  # app carries its own dependencies.yaml in its tree, so resolution has to
+  # recurse into the package rather than stop at the manifest that named it.
+  - url: ./fixtures/app.git
+    version: "=1.0.0"
+
+  # a plain leaf: bare semver tags, no prefix, no replacement.
+  - url: ./fixtures/base.git
+    version: ">=0.1"

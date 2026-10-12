@@ -42,8 +42,10 @@ resolved tag points at.
 - ✅ designed for flexibility - `gipm` utilizes semantic version ranges, improving flexibility over submodule limitations
 - 🔒 designed for repeatability - `gipm` provides a .lock file to guarantee repeatability when necessary
 - 🧠 designed for portability - `gipm` utilizes the [`gix`](https://github.com/GitoxideLabs/gitoxide) library to drive its git interactions; no need to manage any external tooling.
-  - Note: `gix` is still undergoing heavy development. Currently, `gix` has limited support for submodules, and if a dependency is cloned containing a submodule, they be recursively initialized using `git` for the time being.
-  - TODO: maybe use a `git2` binding?
+  - Note: submodules are read from the parent's index (`gix::Repository::submodules()`) and cloned
+    through the same object-clone path as their parent, so a submodule's progress arrives in gix's
+    tree rather than being scraped from a child process. Nested submodules are handled by the same
+    recursion; there is no shelled-out `git` anywhere in the tool.
 
 `gipm` works by reading in a `dependencies.yaml` file, with the following format:
 
@@ -132,6 +134,42 @@ For most repositories, `gipm` can automatically infer a prefix to a semantic ver
 ### replacement
 
 For most repositories, `gipm` can automatically infer common replacements for semantic version matching with tags. Most commonly this may be `-`, or `_`. However, if this cannot be automatically inferred, it can be explicitly specified here. Note that a semantic version is in the form `major.minor.patch` for release versions.
+
+## Testing
+
+The suite is hermetic: every target builds its own fixture repositories (tiny bare repos reached
+over `file://`) and points `HOME` at a per-target cache, so no test reads or writes `~/.gipm/db`
+and none needs network — except `test_network`, which is opt-in and skips when `GIPM_NETWORK` is
+unset.
+
+```sh
+cargo test --all-features              # all targets
+cargo test --test test_update          # one target: test_lockfile | test_update | test_sync | test_clean
+                                       #   test_submodule | test_branches | test_failure | test_cache
+                                       #   test_cli | test_drift | test_manifest | test_broken | test_upstream
+                                       #   test_network (needs GIPM_NETWORK=1)
+cargo llvm-cov --all-features --workspace --ignore-filename-regex='tests/|third_party/'
+```
+
+What each new target pins down:
+
+- `test_submodule` - a three-level nested submodule chain; each level is pinned to the commit its
+  parent recorded, not to the child's `HEAD`, and the lockfile stays flat (one package).
+- `test_branches` - a fixture whose default branch is `trunk`, not `main`.
+- `test_failure` - bad url, unsatisfiable range, malformed version string, malformed manifest,
+  `sync` with no lockfile; nothing is half-written.
+- `test_cache` - a cached database that opens but holds no objects is treated as absent and re-cloned.
+- `test_cli` - the flag surface, and that stdout carries only the summary table.
+- `test_drift` - re-resolving an existing checkout to a different tag moves `HEAD`, the tag ref and
+  the worktree in both directions.
+- `test_manifest` - a committed manifest replayed through `sync`/`update`/`clean`.
+- `test_broken` - a lockfile entry that cannot be honoured fails, is reported, and leaves the rest
+  of the table intact.
+- `test_upstream` - upstream grew a new tag after the initial resolution; the checkout fetches it.
+- `test_network` - the only target that reaches a live remote, and it is opt-in: without
+  `GIPM_NETWORK=1` it says so and passes. When on it resolves `test-repo-1` over https, replays a
+  warm update against the databases it just downloaded, fails a repository the server refuses to
+  serve, and runs the CLI under a pty — the only way the progress renderer draws at all.
 
 ## Limitations
 

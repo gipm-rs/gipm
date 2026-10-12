@@ -80,7 +80,16 @@ impl Log for GipmLogger {
     }
 
     fn log(&self, record: &Record) {
-        if record.level().to_level_filter() > max_level() {
+        // Ask the trait hook instead of repeating the level test here. `log` requires
+        // `enabled` and `flush` in its `Log` trait and never calls either one itself — its
+        // macros consult the cached `LevelFilter` — so delegating here is what keeps the
+        // hook load-bearing rather than dead code that only satisfies the trait.
+        let probe: Metadata = Metadata::builder()
+            .level(record.level())
+            .target(record.target())
+            .build();
+
+        if !self.enabled(&probe) {
             return;
         }
 
@@ -143,6 +152,13 @@ pub fn init(options: InitOptions) {
             spec
         );
     }
+}
+
+/// Flush the backend through the global logger. Nothing in `log` calls the trait's
+/// `flush` hook, so the CLI does it once at exit: a logger that buffered would otherwise
+/// lose its tail on `process::exit`.
+pub fn flush() {
+    log::logger().flush()
 }
 
 pub fn current_level() -> LevelFilter {
@@ -389,7 +405,7 @@ fn visible_width(text: String) -> usize {
             continue;
         }
 
-        width += 1;
+        width += glyph_width(ch);
     }
 
     width
@@ -456,10 +472,8 @@ fn fit_cell(value: String, width: usize) -> String {
         let marker: usize = visible_width(ellipsis.to_string());
 
         if width > marker {
-            return pad(
-                &truncate_visible(value.clone(), width - marker).clone(),
-                width,
-            );
+            let cut: String = truncate_visible(value.clone(), width - marker);
+            return pad(&format!("{}{}", cut, ellipsis), width);
         }
 
         return "".to_string();
@@ -947,6 +961,254 @@ fn test_summary_cell_cutting() -> anyhow::Result<()> {
         visible_width("émö亝".to_string()) == 5,
         "visible_width must count display columns, not code points",
     );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_glyphs_and_widths() -> anyhow::Result<()> {
+    // Styling is off in a unit test (init never ran), so every glyph must come back
+    // bare -- and bare ASCII, which is the whole point of the ASCII glyph set.
+    anyhow::ensure!(sym_ok() == "ok", "sym_ok must be bare ascii: {}", sym_ok());
+    anyhow::ensure!(
+        sym_warn() == "~",
+        "sym_warn must be bare ascii: {}",
+        sym_warn()
+    );
+    anyhow::ensure!(
+        sym_fail() == "xx",
+        "sym_fail must be bare ascii: {}",
+        sym_fail()
+    );
+    anyhow::ensure!(
+        sym_dirty() == "dirty",
+        "sym_dirty must be bare ascii: {}",
+        sym_dirty()
+    );
+    anyhow::ensure!(
+        sym_lock() == "#",
+        "sym_lock must be bare ascii: {}",
+        sym_lock()
+    );
+
+    anyhow::ensure!(
+        level_color(Level::Error) == RED,
+        "error must take the red column: {}",
+        level_color(Level::Error),
+    );
+    anyhow::ensure!(
+        level_color(Level::Warn) == YELLOW,
+        "warn must take the yellow column: {}",
+        level_color(Level::Warn),
+    );
+    anyhow::ensure!(
+        level_color(Level::Info) == DIM,
+        "info must take the dim column: {}",
+        level_color(Level::Info),
+    );
+    anyhow::ensure!(
+        level_color(Level::Debug) == GREY,
+        "debug must take the grey column: {}",
+        level_color(Level::Debug),
+    );
+    anyhow::ensure!(
+        level_color(Level::Trace) == GREY,
+        "trace must share the grey column: {}",
+        level_color(Level::Trace),
+    );
+
+    anyhow::ensure!(
+        level_tag(Level::Warn) == "WARN : ",
+        "the tag is padded to five columns then a colon: {}",
+        level_tag(Level::Warn),
+    );
+    anyhow::ensure!(
+        level_tag(Level::Info) == "INFO : ",
+        "the tag is padded to five columns then a colon: {}",
+        level_tag(Level::Info),
+    );
+
+    anyhow::ensure!(
+        indent_continuation("first\nsecond") == "first\n       second",
+        "a cause chain must line up under the tag: {}",
+        indent_continuation("first\nsecond"),
+    );
+
+    let stamp: String = timestamp();
+    anyhow::ensure!(
+        stamp.len() == 8 && stamp[2..3] == *":" && stamp[5..6] == *":",
+        "the timestamp is HH:MM:SS, got {stamp}",
+    );
+
+    // Widths must ignore styling but count the visible glyphs, and a CJK/emoji cell
+    // is two columns wide -- the table is padded by visible width, not char count.
+    anyhow::ensure!(
+        visible_width("plain".to_string()) == 5,
+        "plain: {}",
+        visible_width("plain".to_string())
+    );
+    anyhow::ensure!(
+        visible_width("\x1b[31mred\x1b[0m".to_string()) == 3,
+        "styling must not count: {}",
+        visible_width("\x1b[31mred\x1b[0m".to_string()),
+    );
+    // Display width, not code point count: combining marks are free, a CJK glyph is
+    // wide. The same `glyph_width` table is used here and when cutting a cell, so a
+    // cell can never pad narrower than it cuts.
+    anyhow::ensure!(
+        visible_width("e\u{301}".to_string()) == 1,
+        "a combining mark must not take a column: {}",
+        visible_width("e\u{301}".to_string()),
+    );
+    anyhow::ensure!(
+        visible_width("\u{4e32}".to_string()) == 2,
+        "a wide glyph pads as two columns: {}",
+        visible_width("\u{4e32}".to_string()),
+    );
+    anyhow::ensure!(
+        visible_width("\u{1f600}".to_string()) == 2,
+        "an emoji pads as two columns: {}",
+        visible_width("\u{1f600}".to_string()),
+    );
+
+    // Cutting *does* use display width, so a wide glyph consumes two of the limit.
+    anyhow::ensure!(
+        truncate_visible("\u{4e32}\u{4e32}\u{4e32}".to_string(), 3) == "\u{4e32}\u{4e32}",
+        "a cut must respect display width, got {}",
+        truncate_visible("\u{4e32}\u{4e32}\u{4e32}".to_string(), 3),
+    );
+
+    // Cutting a cell: the marker is ASCII ".." while styling is off.
+    anyhow::ensure!(
+        truncate_visible("abcdef".to_string(), 3) == "abc",
+        "cut: {}",
+        truncate_visible("abcdef".to_string(), 3),
+    );
+    anyhow::ensure!(
+        truncate_visible("\x1b[32mabcdef\x1b[0m".to_string(), 3) == "\x1b[32mabc\x1b[0m",
+        "a cut inside an open style must re-close it, got {}",
+        truncate_visible("\x1b[32mabcdef\x1b[0m".to_string(), 3),
+    );
+    anyhow::ensure!(
+        truncate_visible("\x1b[32mab\x1b[0m".to_string(), 2) == "\x1b[32mab\x1b[0m",
+        "a cut that lands exactly on the style close must not add a second reset: {}",
+        truncate_visible("\x1b[32mab\x1b[0m".to_string(), 2),
+    );
+
+    anyhow::ensure!(
+        fit_cell("ab".to_string(), 4) == "ab  ",
+        "a short cell is padded to the column: {}",
+        fit_cell("ab".to_string(), 4),
+    );
+    // The cut reserves room for a marker (… styled, .. plain) but never writes it,
+    // so a truncated cell is short-padded. Asserted as it is; AGENTS.md promises the
+    // marker, see todo.md.
+    anyhow::ensure!(
+        fit_cell("abcdef".to_string(), 4) == "ab..",
+        "a long cell is cut and short-padded: {}",
+        fit_cell("abcdef".to_string(), 4),
+    );
+    anyhow::ensure!(
+        fit_cell("abcdef".to_string(), 2) == "".to_string(),
+        "a column too narrow for content plus marker is dropped, not half-drawn: {}",
+        fit_cell("abcdef".to_string(), 2),
+    );
+    anyhow::ensure!(
+        fit_cell("\x1b[32mabcdef\x1b[0m".to_string(), 4) == "\x1b[32mab\x1b[0m..",
+        "a styled cell closes its colour run before the marker: {}",
+        fit_cell("\x1b[32mabcdef\x1b[0m".to_string(), 4),
+    );
+
+    // current_level() reads the installed level, so it is only meaningful after init;
+    // it has no in-repo caller (see todo.md) and is asserted in its own test.
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_init_sets_the_level_it_resolved() -> anyhow::Result<()> {
+    // init is documented idempotent so a test may call it; keep colour off here so the
+    // other tests in this binary still see unstyled output.
+    let explicit: InitOptions = InitOptions {
+        verbosity: 0,
+        quiet: false,
+        color: ColorMode::Never,
+        plain: false,
+        log_level: Some("debug".to_string()),
+    };
+    init(explicit);
+    anyhow::ensure!(
+        current_level() == LevelFilter::Debug,
+        "init must install the level it resolved: {:?}",
+        current_level(),
+    );
+
+    let rustlog: InitOptions = InitOptions {
+        verbosity: 0,
+        quiet: false,
+        color: ColorMode::Never,
+        plain: false,
+        log_level: Some("my_module=trace".to_string()),
+    };
+    init(rustlog);
+    anyhow::ensure!(
+        current_level() == LevelFilter::Trace,
+        "a rust-log style --log-level must resolve through parse_rust_log: {:?}",
+        current_level(),
+    );
+
+    let bogus: InitOptions = InitOptions {
+        verbosity: 1,
+        quiet: false,
+        color: ColorMode::Never,
+        plain: false,
+        log_level: Some("nope".to_string()),
+    };
+    init(bogus);
+    anyhow::ensure!(
+        current_level() == LevelFilter::Info,
+        "an unrecognized --log-level must fall back to the -v count: {:?}",
+        current_level(),
+    );
+
+    let off: InitOptions = InitOptions {
+        verbosity: 0,
+        quiet: true,
+        color: ColorMode::Never,
+        plain: false,
+        log_level: Some("off".to_string()),
+    };
+    init(off);
+    anyhow::ensure!(
+        current_level() == LevelFilter::Off,
+        "--log-level off must silence everything, including -q: {:?}",
+        current_level(),
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_result_and_failure_reporting() -> anyhow::Result<()> {
+    // Both of these go through progress::write_line, so they land on stderr and never
+    // on stdout -- which is why the summary table alone must survive `2>/dev/null`.
+    let failure: anyhow::Error =
+        anyhow::anyhow!("checkout failed").context("Failed to check out zlib");
+
+    anyhow::ensure!(
+        error_text(&failure)
+            .split('\n')
+            .collect::<Vec<&str>>()
+            .len()
+            == 2,
+        "a cause chain must be one line per cause: {}",
+        error_text(&failure),
+    );
+
+    report_error(&failure);
+    result("All dependencies resolved and checked out successfully".to_string());
 
     Ok(())
 }

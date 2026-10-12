@@ -155,3 +155,84 @@ fn test_bad_version() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[test]
+fn test_parse_yaml_content() -> anyhow::Result<()> {
+    let content: String =
+        "dependencies:\n  - version: \"^1\"\n    url: file://./fixtures/pkg.git\n    prefix: v\n    replacement:\n      - [\"_\", \".\"]\n".to_string();
+
+    let specs: Vec<DependencySpecification> = parse_dependencies_yaml_content(&content)?;
+    let count: usize = specs.len();
+    anyhow::ensure!(count == 1, "expected one specification, got {count}",);
+
+    let spec: DependencySpecification = specs[0].clone();
+    anyhow::ensure!(
+        spec.version == "^1"
+            && spec.url == "file://./fixtures/pkg.git"
+            && spec.prefix == Some("v".to_string())
+            && spec.replacement == Some(vec![["_".to_string(), ".".to_string()]]),
+        "the specification lost its prefix or replacement: {spec}",
+    );
+
+    // Both optional fields default when the manifest omits them.
+    let bare: String =
+        "dependencies:\n  - version: \">=0.1\"\n    url: file://./fixtures/leaf.git\n".to_string();
+    let bare_specs: Vec<DependencySpecification> = parse_dependencies_yaml_content(&bare)?;
+    anyhow::ensure!(
+        bare_specs.len() == 1 && bare_specs[0].prefix == None && bare_specs[0].replacement == None,
+        "omitted fields must default to None",
+    );
+
+    // A truncated document is an authoring error, not an empty dependency set.
+    let broken: Result<Vec<DependencySpecification>> =
+        parse_dependencies_yaml_content("dependencies: [");
+    anyhow::ensure!(broken.is_err(), "truncated yaml parsed as an empty set");
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_bounding_ranges() -> anyhow::Result<()> {
+    let specs: Vec<DependencySpecification> = vec![
+        DependencySpecification::new("^1".to_string(), "file://a.git".to_string(), None, None),
+        DependencySpecification::new(">=0.1".to_string(), "file://b.git".to_string(), None, None),
+    ];
+
+    let pairs: Vec<(GitPackage, Ranges<Version>)> =
+        dependency_spec_to_package_and_version_range(specs)?;
+    let count: usize = pairs.len();
+    anyhow::ensure!(
+        count == 2,
+        "expected two resolved specifications, got {count}",
+    );
+
+    let caret: Version = Version::new(1, 5, 0);
+    let too_high: Version = Version::new(2, 0, 0);
+    anyhow::ensure!(
+        pairs[0].1.contains(&caret) && !pairs[0].1.contains(&too_high),
+        "^1 must accept 1.5.0 and reject 2.0.0",
+    );
+
+    let lower: Version = Version::new(0, 1, 0);
+    let too_low: Version = Version::new(0, 0, 9);
+    anyhow::ensure!(
+        pairs[1].1.contains(&lower) && !pairs[1].1.contains(&too_low),
+        ">=0.1 must accept 0.1.0 and reject 0.0.9",
+    );
+
+    // A version string that is not a requirement fails the whole conversion,
+    // carrying the specification it came from.
+    let bad: Vec<DependencySpecification> = vec![DependencySpecification::new(
+        "not_a_version".to_string(),
+        "file://c.git".to_string(),
+        None,
+        None,
+    )];
+    let result: Result<Vec<(GitPackage, Ranges<Version>)>> =
+        dependency_spec_to_package_and_version_range(bad);
+    anyhow::ensure!(result.is_err(), "a non-requirement string must not resolve");
+
+    Ok(())
+}

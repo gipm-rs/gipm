@@ -85,8 +85,30 @@ pub fn main() -> anyhow::Result<()> {
         // exit non-zero ourselves; returning the error would let anyhow print the same
         // message a second time, untagged.
         logging::report_error(e);
+        logging::flush();
         std::process::exit(1);
     }
+
+    logging::flush();
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_chosen_color() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        chosen_color(ColorChoice::Auto) == logging::ColorMode::Auto,
+        "auto must stay auto",
+    );
+    anyhow::ensure!(
+        chosen_color(ColorChoice::Always) == logging::ColorMode::Always,
+        "always must stay always",
+    );
+    anyhow::ensure!(
+        chosen_color(ColorChoice::Never) == logging::ColorMode::Never,
+        "never must stay never",
+    );
 
     Ok(())
 }

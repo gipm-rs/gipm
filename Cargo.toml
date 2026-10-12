@@ -55,3 +55,51 @@ path = "tests/sync/test_sync.rs"
 [[test]]
 name = "test_clean"
 path = "tests/clean/test_clean.rs"
+
+[[test]]
+name = "test_submodule"
+path = "tests/submodule/test_submodule.rs"
+
+[[test]]
+name = "test_failure"
+path = "tests/failure/test_failure.rs"
+
+[[test]]
+name = "test_branches"
+path = "tests/branches/test_branches.rs"
+
+[[test]]
+name = "test_cache"
+path = "tests/cache/test_cache.rs"
+
+[[test]]
+name = "test_cli"
+path = "tests/cli/test_cli.rs"
+
+[[test]]
+name = "test_manifest"
+path = "tests/manifest/test_manifest.rs"
+
+[[test]]
+name = "test_drift"
+path = "tests/drift/test_drift.rs"
+
+[[test]]
+name = "test_broken"
+path = "tests/broken/test_broken.rs"
+
+
+[[test]]
+name = "test_upstream"
+path = "tests/upstream/test_upstream.rs"
+[[test]]
+name = "test_network"
+path = "tests/network/test_network.rs"
+
+[[test]]
+name = "test_pty"
+path = "tests/pty/test_pty.rs"
+
+[[test]]
+name = "test_diamond"
+path = "tests/diamond/test_diamond.rs"

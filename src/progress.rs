@@ -673,11 +673,6 @@ pub fn child(message: String) -> Item {
     PROGRESS.add_child(message)
 }
 
-/// A nested item: recorded for gix callbacks, folded into its parent's bar.
-pub fn subchild(parent: &mut Item, message: String) -> Item {
-    parent.add_child(message)
-}
-
 #[cfg(test)]
 #[test]
 fn test_bar_pacing() -> anyhow::Result<()> {

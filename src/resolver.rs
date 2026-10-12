@@ -264,3 +264,40 @@ impl DependencyProvider for GitDependencyProvider {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+#[test]
+fn test_cache_reports_an_unreachable_package() -> anyhow::Result<()> {
+    let mut cache: DependencyCache = DependencyCache::new();
+
+    // A package whose database was never cloned has no transitive manifest to read.
+    // The provider must say so through pubgrub rather than inventing an empty set --
+    // an empty set would resolve the package as a leaf and check it out.
+    let pkg: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("file://a-package-this-run-never-clones.git".to_string()),
+        None,
+        None,
+    );
+    let version: Version = Version::new(1, 0, 0);
+
+    let result = cache.get_dependencies(&pkg, &version).unwrap();
+
+    match result {
+        Dependencies::Unavailable(message) => {
+            let detail: String = message.clone();
+            anyhow::ensure!(
+                detail.contains("Database for dependency"),
+                "the failure was not reported as an unavailable database: {detail}",
+            );
+        }
+        Dependencies::Available(deps) => {
+            let count: usize = deps.iter().count();
+            anyhow::ensure!(
+                count == 0,
+                "an uncloned package reported {count} transitive dependencies",
+            );
+        }
+    }
+
+    Ok(())
+}

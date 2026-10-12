@@ -126,11 +126,23 @@ impl GitPackage {
         Ok(path)
     }
 
-    pub fn is_dirty(&self) -> bool {
-        let repo = gix::open(self.get_checkout_path().expect("Repo must exist"))
-            .expect("Error opening repo");
+    pub fn is_dirty(&self) -> anyhow::Result<bool> {
+        let path = self.get_checkout_path()?;
+        let repo = gix::open(&path)?;
 
-        repo.is_dirty().expect("Error determining repo dirtiness")
+        // A checkout that lost its own object store still opens, but HEAD no longer
+        // resolves to a commit -- gix panics deeper inside `is_dirty` for that state,
+        // so the absence is detected here and reported as an error naming the package
+        // instead of aborting the run. Detached HEADs are fine: this asks whether HEAD
+        // resolves, not whether it names a branch.
+        if repo.head_commit().is_err() {
+            return Err(anyhow::anyhow!(
+                "Checkout for {} is damaged: its repository has no HEAD",
+                self.name()
+            ));
+        }
+
+        Ok(repo.is_dirty()?)
     }
 
     pub fn update_db(&mut self) -> anyhow::Result<()> {
@@ -425,6 +437,16 @@ impl GitPackage {
                 processed_req = processed_req.replace(from, to);
             }
         }
+
+        // `==1.2.13` is how most people write an exact match; semver's grammar takes a
+        // single `=`, so fold the doubled operator before parsing rather than rejecting
+        // it outright.
+        let processed_req: String = if processed_req.starts_with("==") {
+            let cut: usize = 1;
+            processed_req[cut..].to_string()
+        } else {
+            processed_req
+        };
 
         // Try to parse as semver, if it fails, try to parse as exact version
         match semver::VersionReq::parse(&processed_req) {
@@ -792,7 +814,7 @@ impl GitPackage {
             .context("Failed to checkout")?;
 
         let checkout_result =
-            self.checkout_object_from_database(object, &mut sub_progress_checkout_overall);
+            self.checkout_object_at(dest.clone(), object, &mut sub_progress_checkout_overall);
 
         sub_progress_checkout_overall.inc();
 
@@ -844,7 +866,21 @@ impl GitPackage {
         object: impl Into<ObjectId>,
         sub_progress: &mut Item,
     ) -> anyhow::Result<()> {
-        let checkout_repo = gix::open(self.get_checkout_path()?)?;
+        self.checkout_object_at(self.get_checkout_path()?, object.into(), sub_progress)
+    }
+
+    /// `checkout_object_from_database` for an explicit checkout directory. A submodule
+    /// is mounted below its parent (`.gitvenv/parent/child`), which is *not* the path
+    /// `get_checkout_path` would derive from its url (`.gitvenv/child`), so every path
+    /// that can reach a submodule has to thread the destination through instead of
+    /// recomputing it.
+    fn checkout_object_at(
+        &self,
+        dest: PathBuf,
+        object: impl Into<ObjectId>,
+        sub_progress: &mut Item,
+    ) -> anyhow::Result<()> {
+        let checkout_repo = gix::open(&dest)?;
         let object = object.into();
         // `try_find_object` rather than `find_object` and a match on the error: the
         // error enum that carried `NotFound` was folded into a composed error type
@@ -1320,7 +1356,7 @@ impl GitPackage {
             // We checked out a symbolic ref, which we MIGHT need to resolve from a grafted and/or tag ref to the proper commit.
             // If we don't do this, the HEAD may mismatch the .lock file, leading to much confusion.
 
-            // Furthermore, calling the chekout_object_from_database will handle submodule init.
+            // Furthermore, calling the checkout_object_from_database will handle submodule init.
 
             // 2. Peel the tag to the target object (usually a commit)
             let commit = repo
@@ -1449,10 +1485,13 @@ pub fn normalize_url(url: &PackageUrl) -> String {
                     normalized.push(':');
                     normalized.push_str(&port.to_string());
                 }
-                // Add path, removing trailing .git and slashes
+                // Add path, removing trailing slashes and then a trailing .git --
+                // order matters: `repo.git/` has to normalize the same as `repo.git`.
+                // The suffix test is case-insensitive so `repo.GIT` folds too.
                 let mut path = parsed.path().trim_end_matches('/').to_string();
-                if let Some(stripped) = path.strip_suffix(".git") {
-                    path = stripped.to_string();
+                if path.len() >= 4 && path.to_ascii_lowercase().ends_with(".git") {
+                    let cut: usize = path.len() - 4;
+                    path = path[0..cut].to_string();
                 }
                 normalized.push_str(&path);
                 // Lowercase for case-insensitivity
@@ -1484,11 +1523,15 @@ pub fn normalize_url(url: &PackageUrl) -> String {
                 s.to_string()
             };
 
-            // Remove trailing .git if present
-            let s = s.strip_suffix(".git").unwrap_or(&s);
-
-            // Remove trailing slashes
+            // Trim a trailing separator first, then the .git suffix, matching the
+            // parsed branch above so both agree on one cache entry.
             let s = s.trim_end_matches('/');
+            let s = if s.len() >= 4 && s.to_ascii_lowercase().ends_with(".git") {
+                let cut: usize = s.len() - 4;
+                &s[0..cut]
+            } else {
+                s
+            };
 
             // Lowercase for case-insensitivity
             s.to_lowercase()
@@ -1553,6 +1596,31 @@ pub fn update_submodules(
         let url: String = resolve_submodule_url(format!("{}", sub.url()?), parent_url, work_dir);
         let dest: PathBuf = sub.work_dir()?;
 
+        // A submodule already sitting at its pinned commit needs no download. The
+        // clone path checks a tree out and then walks the submodule table again, so
+        // one pass can arrive on a directory that already holds the repository --
+        // `clone_object_into` refuses those on principle (it is a clone, not a
+        // checkout), and refusing there would make the second pass an error.
+        let already: bool = match gix::open(&dest) {
+            Err(_) => false,
+            Ok(existing) => match existing.head() {
+                Err(_) => false,
+                Ok(head) => match head.into_peeled_id() {
+                    Err(_) => false,
+                    Ok(id) => id == pinned,
+                },
+            },
+        };
+
+        if already {
+            let item = subprogress.add_child(format!("{} already at {}", name, pinned));
+            item.done(format!("{} submodule already at {}", name, pinned));
+            drop(item);
+            updated += 1;
+            subprogress.inc();
+            continue;
+        }
+
         let dep = GitPackage::new(PackageUrl::GitUrl(url), Some(name.clone()), None);
 
         let mut item = subprogress.add_child(format!("{} clone", name));
@@ -1603,4 +1671,475 @@ fn resolve_submodule_url(raw: String, parent_url: &PackageUrl, work_dir: &Path) 
     }
 
     work_dir.join(raw).display().to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn test_package_url_identity() -> anyhow::Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let https: PackageUrl = PackageUrl::GitUrl("https://github.com/user/repo.git".to_string());
+    let ssh: PackageUrl = PackageUrl::GitUrl("ssh://git@github.com/user/repo.git".to_string());
+    let scp: PackageUrl = PackageUrl::GitUrl("git@github.com:user/repo.git".to_string());
+
+    anyhow::ensure!(
+        https.as_str() == "https://github.com/user/repo.git",
+        "as_str must hand the url back verbatim, got {}",
+        &https.as_str(),
+    );
+    anyhow::ensure!(
+        https.as_bytes() == b"https://github.com/user/repo.git",
+        "as_bytes must be as_str's bytes: {}",
+        &https.as_str(),
+    );
+    anyhow::ensure!(
+        PackageUrl::Root.as_str() == "Root Package",
+        "the root package has no url, got {}",
+        &PackageUrl::Root.as_str(),
+    );
+    anyhow::ensure!(
+        PackageUrl::Root.as_bytes() == b"Root Package",
+        "as_bytes must agree with as_str on the root package",
+    );
+    let https_shown: String = format!("{}", https.clone());
+    anyhow::ensure!(
+        https_shown == https.as_str(),
+        "Display must print the url verbatim, got {https_shown}",
+    );
+    let root_shown: String = format!("{}", PackageUrl::Root);
+    anyhow::ensure!(
+        root_shown == "Root Package",
+        "Display must name the root package, got {root_shown}",
+    );
+
+    let hash_of = |url: PackageUrl| -> u64 {
+        let mut hasher: DefaultHasher = DefaultHasher::new();
+        url.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let https_hash: u64 = hash_of(https.clone());
+    anyhow::ensure!(
+        https_hash == hash_of(ssh.clone()) && hash_of(ssh.clone()) == hash_of(scp.clone()),
+        "https/ssh/scp spellings of one repo must hash alike: {:x} {:x} {:x}",
+        https_hash,
+        hash_of(ssh.clone()),
+        hash_of(scp.clone()),
+    );
+    anyhow::ensure!(
+        https_hash != hash_of(PackageUrl::Root),
+        "the root package must not collide with a real url",
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_git_package_identity() -> anyhow::Result<()> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let https: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://github.com/user/repo.git".to_string()),
+        None,
+        None,
+    );
+    let tokened: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://user:sekret@github.com/user/repo.git".to_string()),
+        Some("v".to_string()),
+        None,
+    );
+    let other: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("git@github.com:user/other.git".to_string()),
+        None,
+        None,
+    );
+
+    anyhow::ensure!(
+        https == tokened,
+        "prefix/replacement are not identity: a userinfo-carrying url is the same package",
+    );
+    anyhow::ensure!(
+        !(https == other),
+        "different repositories must not compare equal",
+    );
+
+    let hash_of = |pkg: GitPackage| -> u64 {
+        let mut hasher: DefaultHasher = DefaultHasher::new();
+        pkg.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let https_hash: u64 = hash_of(https.clone());
+    anyhow::ensure!(
+        https_hash == hash_of(tokened.clone()),
+        "Hash must agree with PartialEq: {:x} vs {:x}",
+        https_hash,
+        hash_of(tokened.clone()),
+    );
+    anyhow::ensure!(
+        https_hash != hash_of(other.clone()),
+        "Hash must not collapse distinct repositories",
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_normalize_url_forms() -> anyhow::Result<()> {
+    let of = |s: &str| -> String { normalize_url(&PackageUrl::GitUrl(s.to_string())) };
+
+    anyhow::ensure!(
+        of("https://github.com/user/repo.git") == "github.com/user/repo",
+        "the .git suffix and the scheme must not survive normalization",
+    );
+    anyhow::ensure!(
+        of("https://user:sekret@github.com/user/repo.git") == "github.com/user/repo",
+        "userinfo must not split one repository into two cache entries: {}",
+        of("https://user:sekret@github.com/user/repo.git"),
+    );
+    anyhow::ensure!(
+        of("ssh://git@github.com/user/repo.git") == "github.com/user/repo",
+        "ssh must agree with https",
+    );
+    // The `.git` strip is case-insensitive and runs after the trailing-slash trim,
+    // so an upper-case suffix and a trailing separator both fold into the same entry.
+    anyhow::ensure!(
+        of("HTTPS://GITHUB.COM/USER/REPO.GIT") == "github.com/user/repo",
+        "case-insensitivity must cover the .git suffix: {}",
+        of("HTTPS://GITHUB.COM/USER/REPO.GIT"),
+    );
+    anyhow::ensure!(
+        of("https://github.com/user/repo/") == "github.com/user/repo",
+        "a trailing slash must not create a second cache entry",
+    );
+    anyhow::ensure!(
+        of("https://example.com:8080/user/repo.git") == "example.com:8080/user/repo",
+        "a non-default port is a different remote and must stay distinct",
+    );
+    anyhow::ensure!(
+        of("file:///home/gipm/tests/update/fixtures/alpha.git")
+            == "/home/gipm/tests/update/fixtures/alpha",
+        "a file:// remote keeps its path (there is no host to fold in): {}",
+        of("file:///home/gipm/tests/update/fixtures/alpha.git"),
+    );
+
+    anyhow::ensure!(
+        of("git@github.com:user/repo.git") == "github.com/user/repo",
+        "the scp-like form is not parseable as a URL and must go through the fallback: {}",
+        of("git@github.com:user/repo.git"),
+    );
+    // The fallback trims the trailing slash before stripping `.git`, so a trailing
+    // separator cannot leave the suffix behind -- it must agree with the parsed
+    // branch above.
+    anyhow::ensure!(
+        of("git@github.com:user/repo.git/") == "github.com/user/repo",
+        "the fallback must fold a trailing separator the same way the parser does: {}",
+        of("git@github.com:user/repo.git/"),
+    );
+
+    anyhow::ensure!(
+        normalize_url(&PackageUrl::Root) == "ROOT",
+        "the root package normalizes to a fixed token",
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_resolve_submodule_url_forms() -> anyhow::Result<()> {
+    let work: PathBuf = Path::new(".gitvenv/parent").to_path_buf();
+
+    let absolute: PackageUrl =
+        PackageUrl::GitUrl("https://gitlab.com/upstream/parent.git".to_string());
+    let sub = |raw: &str, parent: &PackageUrl| -> String {
+        resolve_submodule_url(raw.to_string(), parent, &work)
+    };
+
+    anyhow::ensure!(
+        sub("https://elsewhere.git", &absolute) == "https://elsewhere.git",
+        "a url carrying a scheme is used as written: {}",
+        sub("https://elsewhere.git", &absolute),
+    );
+    anyhow::ensure!(
+        sub("git@github.com:org/dep.git", &absolute) == "git@github.com:org/dep.git",
+        "the scp-like form counts as absolute: {}",
+        sub("git@github.com:org/dep.git", &absolute),
+    );
+
+    // git resolves a scheme-less submodule url against the *parent's remote*,
+    // dropping only the last path segment -- not against the checkout directory.
+    anyhow::ensure!(
+        sub("dep.git", &absolute) == "https://gitlab.com/upstream/dep.git",
+        "a relative url must be resolved against the parent remote: {}",
+        sub("dep.git", &absolute),
+    );
+    anyhow::ensure!(
+        sub("nested/dep.git", &absolute) == "https://gitlab.com/upstream/nested/dep.git",
+        "only the last segment of the parent url is dropped: {}",
+        sub("nested/dep.git", &absolute),
+    );
+
+    // A local parent written as a bare path (no scheme) has no remote to lean on, so
+    // the checkout directory is the base.
+    let local: PackageUrl = PackageUrl::GitUrl("/home/gipm/fixtures/parent.git".to_string());
+    anyhow::ensure!(
+        sub("dep.git", &local) == ".gitvenv/parent/dep.git",
+        "a scheme-less local parent has no remote to resolve against: {}",
+        sub("dep.git", &local),
+    );
+
+    // A `file://` parent does carry "://", so it takes the remote-resolution branch: the
+    // fixture manifests in this repository use exactly that spelling, which is why the
+    // submodule url resolves against the fixture directory rather than the checkout.
+    let filed: PackageUrl = PackageUrl::GitUrl("file:///home/gipm/fixtures/parent.git".to_string());
+    anyhow::ensure!(
+        sub("dep.git", &filed) == "file:///home/gipm/fixtures/dep.git",
+        "a file:// parent is treated as a remote, not as a checkout directory: {}",
+        sub("dep.git", &filed),
+    );
+
+    let parentless: PackageUrl = PackageUrl::GitUrl("parent".to_string());
+    anyhow::ensure!(
+        sub("dep.git", &parentless) == ".gitvenv/parent/dep.git",
+        "a parent url with no path separator leaves no base to use: {}",
+        sub("dep.git", &parentless),
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_extract_version_from_tag() -> anyhow::Result<()> {
+    let underscores: Option<Vec<[String; 2]>> = Some(vec![["_".to_string(), ".".to_string()]]);
+    let nothing: Option<Vec<[String; 2]>> = None;
+
+    let shown = |v: &Option<Version>| -> String {
+        match v {
+            Some(v) => format!("{}", v),
+            None => "<rejected>".to_string(),
+        }
+    };
+
+    let tagged: Option<Version> =
+        GitPackage::extract_version_from_tag("curl-1_0_0", Some("curl-"), &underscores);
+    anyhow::ensure!(
+        shown(&tagged) == "1.0.0",
+        "a prefixed, underscored tag must become a version: {}",
+        shown(&tagged),
+    );
+
+    let unprefixed: Option<Version> =
+        GitPackage::extract_version_from_tag("v1.2.3", None, &nothing);
+    anyhow::ensure!(
+        shown(&unprefixed) == "1.2.3",
+        "a bare v-prefix is stripped without any prefix configured: {}",
+        shown(&unprefixed),
+    );
+
+    let wrong_case: Option<Version> =
+        GitPackage::extract_version_from_tag("v0.9.1", Some("V"), &nothing);
+    anyhow::ensure!(
+        shown(&wrong_case) == "0.9.1",
+        "the prefix match is case-insensitive: {}",
+        shown(&wrong_case),
+    );
+
+    let wrong_prefix: Option<Version> =
+        GitPackage::extract_version_from_tag("0.9.1", Some("v"), &nothing);
+    anyhow::ensure!(
+        wrong_prefix.is_none(),
+        "a tag that does not carry the configured prefix is not a version: {}",
+        shown(&wrong_prefix),
+    );
+
+    let unrewritten: Option<Version> =
+        GitPackage::extract_version_from_tag("curl-1_2_0", Some("curl-"), &nothing);
+    anyhow::ensure!(
+        unrewritten.is_none(),
+        "without a replacement the underscores stay and the tag is not a version: {}",
+        shown(&unrewritten),
+    );
+
+    let prerelease: Option<Version> =
+        GitPackage::extract_version_from_tag("1.2.3-rc1", None, &nothing);
+    anyhow::ensure!(
+        prerelease.is_none(),
+        "a pre-release tag must not be offered as a version: {}",
+        shown(&prerelease),
+    );
+    let built: Option<Version> = GitPackage::extract_version_from_tag("1.2.3+opt", None, &nothing);
+    anyhow::ensure!(
+        built.is_none(),
+        "a build-suffixed tag must not be offered as a version: {}",
+        shown(&built),
+    );
+    let not_a_version: Option<Version> =
+        GitPackage::extract_version_from_tag("release-notes", None, &nothing);
+    anyhow::ensure!(
+        not_a_version.is_none(),
+        "an unrelated tag is not a version: {}",
+        shown(&not_a_version),
+    );
+
+    let empty_prefix: Option<Version> =
+        GitPackage::extract_version_from_tag("1.0.0", Some(""), &nothing);
+    anyhow::ensure!(
+        shown(&empty_prefix) == "1.0.0",
+        "an empty prefix must match every tag: {}",
+        shown(&empty_prefix),
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_package_paths() -> anyhow::Result<()> {
+    let alpha: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://github.com/upstream/alpha.git".to_string()),
+        None,
+        None,
+    );
+    let spelled_other: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("git@github.com:upstream/alpha.git".to_string()),
+        None,
+        None,
+    );
+    let beta: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://github.com/upstream/beta.git".to_string()),
+        None,
+        None,
+    );
+    let slashed: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://github.com/upstream/alpha.git/".to_string()),
+        None,
+        None,
+    );
+    let backslashed: GitPackage = GitPackage::new(
+        PackageUrl::GitUrl("https://github.com\\upstream\\alpha.git".to_string()),
+        None,
+        None,
+    );
+
+    anyhow::ensure!(
+        alpha.name() == "alpha",
+        "name() must take the last segment of the *normalized* url: {}",
+        alpha.name(),
+    );
+    anyhow::ensure!(
+        spelled_other.name() == alpha.name(),
+        "two spellings of one repo must share one name: {} vs {}",
+        spelled_other.name(),
+        alpha.name(),
+    );
+    anyhow::ensure!(
+        beta.name() == "beta",
+        "distinct repos must get distinct names: {}",
+        beta.name(),
+    );
+
+    let checkout: PathBuf = alpha.get_checkout_path().unwrap();
+    anyhow::ensure!(
+        checkout.ends_with("alpha"),
+        "the checkout directory is named after the repository, .git suffix gone: {}",
+        checkout.display(),
+    );
+    anyhow::ensure!(
+        slashed.get_checkout_path().unwrap() == checkout,
+        "a trailing slash must not fork the checkout directory: {}",
+        slashed.get_checkout_path().unwrap().display(),
+    );
+    anyhow::ensure!(
+        backslashed.get_checkout_path().unwrap() == checkout,
+        "a backslash-separated url must land in the same checkout: {}",
+        backslashed.get_checkout_path().unwrap().display(),
+    );
+    anyhow::ensure!(
+        beta.get_checkout_path().unwrap() != checkout,
+        "distinct repos must not share a checkout directory",
+    );
+
+    let home: PathBuf = home_dir().expect("Could not determine home directory");
+    let db_root: PathBuf = home.join(".gipm").join("db");
+
+    let alpha_db: PathBuf = alpha.get_database_path().unwrap();
+    anyhow::ensure!(
+        alpha_db.starts_with(&db_root),
+        "the database cache must live under {}: {}",
+        db_root.display(),
+        alpha_db.display(),
+    );
+    anyhow::ensure!(
+        alpha_db == spelled_other.get_database_path().unwrap(),
+        "one repository must occupy one cache entry, whatever the spelling: {} vs {}",
+        alpha_db.display(),
+        spelled_other.get_database_path().unwrap().display(),
+    );
+    anyhow::ensure!(
+        alpha_db != beta.get_database_path().unwrap(),
+        "distinct repositories must not collide in the cache: {}",
+        alpha_db.display(),
+    );
+
+    // A package that was never fetched has no database, and the membership probes
+    // must answer "no" rather than failing -- that is what lets sync decide to refetch.
+    anyhow::ensure!(
+        alpha.does_ref_exist_in_db("1.0.0").unwrap_or(false) == false,
+        "a missing database must answer 'no ref', not an error",
+    );
+    let sha = gix::ObjectId::from_hex("aa5a6e02b60c7b6077f6c5d90a10fff0badbe7c5".as_bytes());
+    anyhow::ensure!(
+        sha.is_ok() && alpha.does_id_exist_in_db(sha.unwrap()).unwrap_or(false) == false,
+        "a missing database must answer 'no object', not an error",
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn test_database_usability() -> anyhow::Result<()> {
+    use std::fs::write;
+
+    let scratch: PathBuf = Path::new("target/gipm-unit-scratch/usability").to_path_buf();
+    remove_dir_all(&scratch).unwrap_or_default();
+
+    // A plain directory is not a repository at all.
+    let plain: PathBuf = scratch.join("plain");
+    create_dir_all(&plain)?;
+    anyhow::ensure!(
+        !database_is_usable(&plain),
+        "a plain directory must not count as a usable database: {}",
+        plain.display(),
+    );
+
+    // The residue an interrupted fetch leaves behind: it opens as a repository, it
+    // even advertises refs, but the objects those refs point at never arrived.
+    let residue: PathBuf = scratch.join("residue");
+    create_dir_all(&residue.join("objects"))?;
+    create_dir_all(&residue.join("refs"))?;
+    write(&residue.join("HEAD"), "ref: refs/heads/main\n")?;
+    write(
+        &residue.join("packed-refs"),
+        "# pack-refs with: peeled fully-peeled sorted \naa5a6e02b60c7b6077f6c5d90a10fff0badbe7c5 refs/tags/1.0.0\n",
+    )?;
+
+    anyhow::ensure!(
+        gix::open(&residue).is_ok(),
+        "the residue must still open as a repository, otherwise the assertion below proves nothing",
+    );
+    anyhow::ensure!(
+        !database_is_usable(&residue),
+        "an interrupted fetch must not leave a database that later runs trust: {}",
+        residue.display(),
+    );
+
+    remove_dir_all(&scratch).unwrap_or_default();
+    Ok(())
 }

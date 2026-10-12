@@ -98,7 +98,7 @@ pub fn sync_dependencies() -> anyhow::Result<()> {
     for (name, version, dep, result) in checkout_results {
         match result {
             Ok(_) => {
-                let status: String = if dep.is_dirty() {
+                let status: String = if dep.is_dirty()? {
                     logging::sym_dirty()
                 } else {
                     logging::sym_ok()
@@ -204,7 +204,7 @@ pub fn install_dependencies() -> anyhow::Result<()> {
     let mut rows: Vec<logging::SummaryRow> = vec![];
     for (dep, version) in &resolved_dependencies {
         if let PackageUrl::GitUrl(_) = &dep.url {
-            let status: String = if dep.is_dirty() {
+            let status: String = if dep.is_dirty()? {
                 logging::sym_dirty()
             } else {
                 logging::sym_ok()
